@@ -1,0 +1,32 @@
+  #!/bin/bash
+
+# WARNING BE SURE TO PROPERLY END LINES WITH SLASH
+# OR ALL YOUR PARAMS WILL BE DROPPED AND YOU WILL GET
+# ALL SORTS OF STRANGE ERRORS
+
+# Auto-restart loop for server
+while true; do
+  echo "Starting server..."
+
+  python server.py  \
+    --email=youremail@gmail.com  \
+    --api-key=foobar \
+    --host=localhost \
+    --port=8000  \
+    --cloud-host=wss://flowcentral.ai  \
+    --cloud-port=443  \
+    --service-name=home \
+    --app-name=flow
+
+  exit_code=$?
+  echo "Server exited with code $exit_code"
+
+  # If exit code is 0 (clean shutdown), don't restart
+  if [ $exit_code -eq 0 ]; then
+    echo "Clean shutdown detected. Not restarting."
+    break
+  fi
+
+  echo "Restarting in 2 seconds..."
+  sleep 2
+done
