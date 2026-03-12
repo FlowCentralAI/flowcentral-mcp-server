@@ -43,7 +43,7 @@ import utils  # Utility module for dynamic functions
 PARENT_PACKAGE_NAME = "dynamic_functions"
 
 # Visibility decorators that allow remote function calls
-VISIBILITY_DECORATORS = ['visible', 'public', 'protected', 'tick', 'chat', 'text', 'session', 'index', 'price', 'location', 'app', 'copy']
+VISIBILITY_DECORATORS = ['visible', 'public', 'protected', 'tick', 'chat', 'text', 'session', 'game', 'index', 'price', 'location', 'app', 'copy']
 
 # --- Identity Decorator Definition ---
 def _mcp_identity_decorator(f):
@@ -292,7 +292,7 @@ class DynamicFunctionManager:
         return app_path.replace(os.sep, '.')
 
     # File operations
-    async def _fs_add_code(self, name: str, code: str, app: Optional[str] = None) -> Optional[str]:
+    async def _fs_add_code(self, name: str, code: str, app: Optional[str] = None) -> str:
         """
         Adds a NEW function to a file (used by function_add).
         The function should NOT already exist (caller must check first).
@@ -306,7 +306,7 @@ class DynamicFunctionManager:
             app: App name in dot notation (e.g., "Examples.Markdown"), or None for root-level
 
         Returns:
-            Full path if successful, None otherwise.
+            Full path if successful.
         """
         # Determine target directory based on app
         if app:
@@ -318,19 +318,19 @@ class DynamicFunctionManager:
             target_dir = self.functions_dir
             location_display = "main.py"
 
-        # Ensure directory exists
-        os.makedirs(target_dir, exist_ok=True)
-        file_path = os.path.join(target_dir, "main.py")
-
-        # Simple rule: if main.py exists, append; otherwise create
-        if os.path.exists(file_path):
-            logger.debug(f"📝 Appending to existing {location_display}")
-            mode = 'a'
-        else:
-            logger.debug(f"📝 Creating new {location_display}")
-            mode = 'w'
-
         try:
+            # Ensure directory exists
+            os.makedirs(target_dir, exist_ok=True)
+            file_path = os.path.join(target_dir, "main.py")
+
+            # Simple rule: if main.py exists, append; otherwise create
+            if os.path.exists(file_path):
+                logger.debug(f"📝 Appending to existing {location_display}")
+                mode = 'a'
+            else:
+                logger.debug(f"📝 Creating new {location_display}")
+                mode = 'w'
+
             if mode == 'a':
                 # When appending, ensure there's a newline separator
                 # First check if file ends with newline
@@ -351,14 +351,11 @@ class DynamicFunctionManager:
 
             logger.debug(f"💾 Added function to {file_path}")
             return file_path
-        except IOError as e:
-            logger.error(f"❌ _fs_add_code: Failed to write file {file_path}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"❌ _fs_add_code: Unexpected error saving {file_path}: {e}")
-            return None
+        except Exception:
+            logger.exception(f"❌ _fs_add_code: Failed to save code for '{name}' to {location_display}")
+            raise
 
-    async def _fs_update_code(self, name: str, code: str, app: Optional[str] = None) -> Optional[str]:
+    async def _fs_update_code(self, name: str, code: str, app: Optional[str] = None) -> str:
         """
         Updates an existing function's file with complete code (used by function_set).
         Overwrites the entire file with the provided code.
@@ -371,7 +368,7 @@ class DynamicFunctionManager:
             app: App name in dot notation for app-specific lookup, None for root-level
 
         Returns:
-            Full path if successful, None otherwise.
+            Full path if successful.
         """
         # Find the file containing this function - MUST exist
         existing_file = await self._find_file_containing_function(name, app)
@@ -381,7 +378,7 @@ class DynamicFunctionManager:
             if app:
                 error_msg += f" for app '{app}'"
             logger.error(f"❌ _fs_update_code: {error_msg}")
-            return None
+            raise FileNotFoundError(error_msg)
 
         # Use the file from the mapping (could be main.py or user-created file)
         file_path = os.path.join(self.functions_dir, existing_file)
@@ -392,12 +389,9 @@ class DynamicFunctionManager:
                 f.write(code)
             logger.debug(f"💾 Updated file {file_path}")
             return file_path
-        except IOError as e:
-            logger.error(f"❌ _fs_update_code: Failed to write file {file_path}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"❌ _fs_update_code: Unexpected error saving {file_path}: {e}")
-            return None
+        except Exception:
+            logger.exception(f"❌ _fs_update_code: Failed to write {file_path}")
+            raise
 
     async def _fs_load_code(self, name, app_name=None):
         """
@@ -431,7 +425,7 @@ class DynamicFunctionManager:
         except (OSError, IOError) as e:
             error_message = f"Function '{name}' found at '{target_file}' but could not be read: {e}"
             logger.error(f"❌ _fs_load_code: {error_message}")
-            raise FileNotFoundError(error_message) from e
+            raise
 
 
     # Metadata extraction and validation
@@ -945,7 +939,7 @@ class DynamicFunctionManager:
                 #logger.debug(f"⚙️ Found {len(functions_info)} function(s) in file")
                 return True, None, functions_info
             else:
-                logger.error("❌ Syntax valid, but no top-level function definition found.")
+                # Don't log here - caller has the filename context
                 return True, "Syntax valid, but no function definition found", None
 
         except SyntaxError as e:
@@ -960,12 +954,11 @@ class DynamicFunctionManager:
             logger.error(f"❌ Code validation failed (AST parse): {error_msg}")
             return False, error_msg, None
         except Exception as e:
-            error_msg = f"Unexpected error during validation or AST processing: {str(e)}"
-            logger.error(f"❌ {error_msg}\n{traceback.format_exc()}") # Log full traceback
-            return False, error_msg, None
+            logger.error(f"❌ Unexpected error during validation or AST processing: {str(e)}\n{traceback.format_exc()}")
+            raise
 
 
-    def _code_generate_stub(self, name: str, location: Optional[str] = None) -> str:
+    def _code_generate_stub(self, name: str, location: Optional[str] = None, description: Optional[str] = None) -> str:
         """
         Generates a string containing a basic Python function stub with the given name.
         """
@@ -974,6 +967,9 @@ class DynamicFunctionManager:
 
         # Add location decorator if provided
         location_decorator = f"@location('{location}')\n" if location else ""
+
+        # Use provided description or default placeholder
+        docstring = description if description else f"This is a placeholder function for '{name}'"
 
         stub = f"""\
 import atlantis
@@ -985,7 +981,7 @@ logger = logging.getLogger("mcp_server")
 {location_decorator}@visible
 async def {name}():
     \"\"\"
-    This is a placeholder function for '{name}'
+    {docstring}
     \"\"\"
     logger.info(f"Executing placeholder function: {name}...")
 
@@ -1007,7 +1003,7 @@ async def {name}():
         self._function_file_mapping_mtime = 0.0
         logger.debug("🧹 Function-to-file mapping cache invalidated")
 
-    async def _build_function_file_mapping(self):
+    async def _build_function_file_mapping(self) -> None:
         """Build the function-to-file mapping by scanning all files recursively."""
         try:
             # Check if we need to rebuild the mapping
@@ -1047,12 +1043,44 @@ async def {name}():
                     #logger.info(f"🎯 EXPLORING SUBFOLDER: {CYAN}{subdir_name}{RESET}")
 
                 for filename in files:
-                    if not filename.endswith('.py'):
+                    if not filename.endswith('.py') and not filename.endswith('.txt'):
                         continue
 
                     file_path = os.path.join(root, filename)
                     # Calculate relative path from functions_dir
                     rel_path = os.path.relpath(file_path, self.functions_dir)
+
+                    # Handle .txt files as static text tools
+                    if filename.endswith('.txt'):
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                content = f.read()
+
+                            # Description is first line of file, or a default
+                            first_line = content.split('\n', 1)[0].strip() if content.strip() else None
+                            description = first_line if first_line else f"Text file: {filename}"
+
+                            func_info = {
+                                'name': filename,  # e.g. "foo.txt"
+                                'description': description,
+                                'inputSchema': {"type": "object", "properties": {}},
+                                'decorators': ["text"],
+                                'text_content_type': "txt",
+                                'is_text_file': True,
+                            }
+
+                            # Determine app_path from directory
+                            app_path = os.path.dirname(rel_path) if '/' in rel_path else None
+
+                            # Feed into duplicate detection flow
+                            key = (app_path, filename)
+                            if key not in all_occurrences:
+                                all_occurrences[key] = []
+                            all_occurrences[key].append((rel_path, func_info))
+
+                        except Exception as e:
+                            logger.warning(f"⚠️ Error processing text file {rel_path}: {e}")
+                        continue
 
                     try:
                         with open(file_path, 'r', encoding='utf-8') as f:
@@ -1099,7 +1127,7 @@ async def {name}():
                                     if has_invalid_protected:
                                         skip_reason = "invalid @protected (missing required protection name)"
                                     else:
-                                        skip_reason = "missing @visible decorator"
+                                        skip_reason = "missing visibility decorator (e.g. @visible, @public, @chat, @text, ...)"
 
                                     # Use error level for invalid @protected, info level for others
                                     log_level = logger.error if has_invalid_protected else logger.info
@@ -1139,9 +1167,9 @@ async def {name}():
                                 all_occurrences[key].append((rel_path, func_info))
                         else:
                             if root != self.functions_dir:
-                                logger.warning(f"⚠️ NO FUNCTIONS FOUND in {rel_path} (subfolder: {os.path.basename(root)})")
+                                logger.warning(f"⚠️ NO FUNCTIONS FOUND in {rel_path} - syntax valid but no top-level function definitions")
                             else:
-                                logger.debug(f"  📍 No functions found in {rel_path}")
+                                logger.debug(f"  📍 No functions found in {rel_path} - no top-level function definitions")
 
                     except Exception as e:
                         logger.warning(f"⚠️ Error processing {rel_path} for function mapping: {e}")
@@ -1210,10 +1238,18 @@ async def {name}():
         # Convert app_name to app_path (None stays None for top-level)
         app_path = self._app_name_to_path(app_name) if app_name else None
 
-        # Always check app-specific mapping first
+        # Always check app-specific mapping first (exact match)
         app_mapping = self._function_file_mapping_by_app.get(app_path, {})
         if function_name in app_mapping:
             return app_mapping[function_name]
+
+        # Case-insensitive fallback for app path (e.g., "Terrain/catgirls" -> "Terrain/Catgirls")
+        if app_path is not None:
+            app_path_lower = app_path.lower()
+            for mapped_app_path, mapped_functions in self._function_file_mapping_by_app.items():
+                if mapped_app_path is not None and mapped_app_path.lower() == app_path_lower:
+                    if function_name in mapped_functions:
+                        return mapped_functions[function_name]
 
         # Only fall back to main mapping if no app was specified
         # When app_name is specified, we only check that specific app to allow
@@ -1337,7 +1373,7 @@ async def {name}():
         except Exception as e:
             raise IOError(f"Failed to write file {file_path}: {e}")
 
-    async def function_add(self, name: str, code: Optional[str] = None, app: Optional[str] = None, location: Optional[str] = None) -> bool:
+    async def function_add(self, name: str, code: Optional[str] = None, app: Optional[str] = None, location: Optional[str] = None, description: Optional[str] = None) -> bool:
         '''
         Creates a new function or re-enables a hidden one.
         If the function exists but has no decorators (was "removed"), adds @visible to re-enable it.
@@ -1381,22 +1417,10 @@ async def {name}():
             return await self._add_visible_decorator(secure_name, file_path)
 
         # Function doesn't exist anywhere - create new
-        try:
-            code_to_save = code if code is not None else self._code_generate_stub(secure_name, location)
-            if await self._fs_add_code(secure_name, code_to_save, app):
-                logger.info(f"Function '{secure_name}' created successfully.")
-                return True
-            else:
-                error_msg = f"Could not save code for '{secure_name}'"
-                logger.error(f"Create failed: {error_msg}")
-                raise IOError(error_msg)
-        except (ValueError, IOError):
-            raise
-        except Exception as e:
-            error_msg = f"Error during function creation for '{secure_name}': {e}"
-            logger.error(error_msg)
-            logger.debug(traceback.format_exc())
-            raise RuntimeError(error_msg) from e
+        code_to_save = code if code is not None else self._code_generate_stub(secure_name, location, description)
+        await self._fs_add_code(secure_name, code_to_save, app)
+        logger.info(f"Function '{secure_name}' created successfully.")
+        return True
 
 
     async def function_remove(self, name: str, app: Optional[str] = None) -> bool:
@@ -1422,6 +1446,9 @@ async def {name}():
                 raise ValueError(f"Function '{secure_name}' not found in app '{app}'")
             else:
                 raise ValueError(f"Function '{secure_name}' not found")
+
+        # Convert relative path to absolute path
+        function_file = os.path.join(self.functions_dir, function_file)
 
         source, lines, func_node = self._get_function_ast_info(secure_name, function_file)
 
@@ -1540,8 +1567,6 @@ async def {name}():
 
         # Add to destination
         dest_file_path = await self._fs_add_code(secure_dest_name, func_code, dest_app)
-        if not dest_file_path:
-            raise IOError(f"Failed to add function to destination app '{dest_app}'")
 
         # Remove from source by deleting those lines
         new_lines = lines[:start_line] + lines[end_line:]
@@ -1666,7 +1691,7 @@ async def {name}():
 
             return self._function_queues[function_key]
 
-    async def function_call(self, name: str, client_id: str, request_id: str, user: Optional[str] = None, **kwargs) -> Any:
+    async def function_call(self, name: str, client_id: Optional[str], request_id: Optional[str], user: Optional[str] = None, **kwargs) -> Any:
         """
         Public API for calling a dynamic function.
         Directly executes the function (bypassing queue for now).
@@ -1675,7 +1700,7 @@ async def {name}():
         """
         return await self._execute_function(name, client_id, request_id, user, **kwargs)
 
-    async def function_call_queued(self, name: str, client_id: str, request_id: str, user: Optional[str] = None, **kwargs) -> Any:
+    async def function_call_queued(self, name: str, client_id: Optional[str], request_id: Optional[str], user: Optional[str] = None, **kwargs) -> Any:
         """
         Queued version of function_call. Automatically queues the call
         so that each function's invocations run sequentially (one at a time).
@@ -1719,7 +1744,7 @@ async def {name}():
         logger.debug(f"Received result from queue processor for {function_key} - request_id: {request_id}, type: {type(result)}")
         return result
 
-    async def _execute_function(self, name: str, client_id: str, request_id: str, user: Optional[str] = None, **kwargs) -> Any:
+    async def _execute_function(self, name: str, client_id: Optional[str], request_id: Optional[str], user: Optional[str] = None, **kwargs) -> Any:
         """
         Internal method that actually executes a dynamic function.
         This is called by the queue processor to run functions sequentially.
@@ -1804,6 +1829,11 @@ async def {name}():
         file_path = os.path.join(self.functions_dir, target_file)
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Dynamic function '{name}' not found at {file_path}")
+
+        # Text file short-circuit: just read and return content, no module loading
+        if target_file.endswith('.txt'):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
 
         context_tokens = None
         # Use the relative path (without .py) for module name, replacing slashes with dots
@@ -2066,16 +2096,31 @@ async def {name}():
         Extracts all function names using AST parsing, uses the first one to find the file.
         Supports optional app parameter for app-specific function targeting.
         Returns the function name (if successful) and a status message (string or dict).
+        Raises exceptions for invalid requests so the server can surface proper tool errors.
         Does *not* perform full syntax validation before saving.
         """
         logger.info("⚙️ Handling _function_set call (using AST parsing for all functions)")
         code_buffer = args.get("code")
         app_name = args.get("app")  # Optional app name for disambiguation
+        name = args.get("name")  # Optional explicit target name
 
         if not code_buffer or not isinstance(code_buffer, str):
             logger.warning("⚠️ function_set: Missing or invalid 'code' parameter.")
-            # Return None for name, and the error message (plain string, MCP formatting in _format_mcp_response)
-            return None, "Error: Missing or invalid 'code' parameter."
+            raise ValueError("Missing or invalid 'code' parameter.")
+
+        # Text file short-circuit: if name ends with .txt, skip Python validation entirely
+        if name and name.endswith('.txt'):
+            existing_file = await self._find_file_containing_function(name, app_name)
+            if not existing_file:
+                raise ValueError(f"Cannot update text file - '{name}' not found in mapping.")
+
+            saved_path = await self._fs_update_code(name, code_buffer, app_name)
+
+            rel_path = os.path.relpath(saved_path, self.functions_dir)
+            logger.info(f"✅ Text file saved to {rel_path}")
+            server._last_functions_dir_mtime = None
+            server._last_servers_dir_mtime = None
+            return name, f"Text file saved to {rel_path}"
 
         # 1. Extract ALL function names using AST parsing
         is_valid, error_message, functions_info = self._code_validate_syntax(code_buffer)
@@ -2083,49 +2128,76 @@ async def {name}():
         if not is_valid:
             error_response = f"Error: Could not parse function code: {error_message}"
             logger.warning(f"⚠️ function_set: Failed to parse code via AST.")
-            return None, error_response
+            raise ValueError(error_response)
 
         if not functions_info:
             error_response = "Error: Could not extract any function names from the provided code. Ensure it contains at least one function definition."
             logger.warning(f"⚠️ function_set: No functions found in code.")
-            return None, error_response
+            raise ValueError(error_response)
 
         # Extract function names
         function_names = [func_info['name'] for func_info in functions_info]
         logger.info(f"⚙️ Extracted {len(function_names)} function(s) via AST: {', '.join(function_names)}")
 
-        # 2. Check if at least one function exists in the mapping (required for update)
-        # Try each function name to find one that exists in the mapping
-        # (The buffer may contain new functions not yet in the mapping)
+        # 2. Identify the existing function/file being updated.
+        # Prefer an explicit target name when provided; otherwise infer from submitted code.
         matched_func_name = None
         existing_file = None
-        for func_name in function_names:
-            existing_file = await self._find_file_containing_function(func_name, app_name)
-            if existing_file:
-                matched_func_name = func_name
-                logger.info(f"⚙️ Matched function '{func_name}' to file: {existing_file}")
-                break
+        if name:
+            matched_func_name = name
+            if name not in function_names:
+                submitted_names = ", ".join(function_names)
+                if len(function_names) == 1:
+                    error_response = (
+                        f"Submitted function '{function_names[0]}' does not match provided name '{name}'. "
+                        f"_function_set cannot rename functions."
+                    )
+                else:
+                    error_response = (
+                        f"Submitted functions ({submitted_names}) do not include provided name '{name}'. "
+                        f"_function_set cannot rename functions."
+                    )
+                if app_name:
+                    error_response += f" App: '{app_name}'."
+                logger.error(f"❌ function_set: {error_response}")
+                raise ValueError(error_response)
 
-        if not existing_file or not matched_func_name:
-            error_response = f"Cannot update functions - none of the functions ({', '.join(function_names)}) found in mapping. Use function_add to create new functions."
-            logger.error(f"❌ function_set: {error_response}")
-            return None, error_response
+            existing_file = await self._find_file_containing_function(name, app_name)
+            if not existing_file:
+                error_response = f"Existing function '{name}' not found."
+                if app_name:
+                    error_response += f" App: '{app_name}'."
+                logger.error(f"❌ function_set: {error_response}")
+                raise ValueError(error_response)
+            logger.info(f"⚙️ Using explicit target function '{name}' mapped to file: {existing_file}")
+        else:
+            for func_name in function_names:
+                existing_file = await self._find_file_containing_function(func_name, app_name)
+                if existing_file:
+                    matched_func_name = func_name
+                    logger.info(f"⚙️ Matched function '{func_name}' to file: {existing_file}")
+                    break
+
+            if not existing_file or not matched_func_name:
+                error_response = (
+                    f"Cannot update functions because none of the submitted function names "
+                    f"({', '.join(function_names)}) exist in the current mapping."
+                )
+                if app_name:
+                    error_response += f" App: '{app_name}'."
+                error_response += " Provide 'name' to target an existing function explicitly, or use function_add to create a new one."
+                logger.error(f"❌ function_set: {error_response}")
+                raise ValueError(error_response)
 
         logger.info(f"⚙️ Updating existing file: {existing_file}")
 
         # 3. Save the code using _fs_update_code (overwrites entire file with complete code)
         saved_path = await self._fs_update_code(matched_func_name, code_buffer, app_name)
 
-        if not saved_path:
-            error_response = f"Error saving functions to file '{existing_file}'."
-            logger.error(f"❌ function_set: {error_response}")
-            # Return matched function name, but with error message
-            return matched_func_name, error_response
-
         logger.info(f"💾 Functions saved successfully to {saved_path}")
 
         # Clear any cached runtime errors for all functions, as they've been updated
-        for func_name in function_names:
+        for func_name in set(function_names + ([matched_func_name] if matched_func_name else [])):
             self._runtime_errors.pop(func_name, None)
 
         # 4. Attempt AST parsing for immediate feedback (but save regardless)
@@ -2147,15 +2219,42 @@ async def {name}():
         #save_status = f"Function saved"
         # Calculate relative path for display
         rel_path = os.path.relpath(saved_path, self.functions_dir)
+        missing_description_names = [
+            func_info["name"]
+            for func_info in functions_info
+            if not (func_info.get("description") or "").strip()
+        ]
+        missing_description_warning = None
+        if missing_description_names:
+            if len(missing_description_names) == 1:
+                missing_description_warning = (
+                    f"Warning: function '{missing_description_names[0]}' has no description docstring."
+                )
+            else:
+                missing_description_warning = (
+                    f"Warning: functions {', '.join(missing_description_names)} have no description docstrings."
+                )
+            logger.warning(f"⚠️ function_set: {missing_description_warning}")
 
         if syntax_error:
             # If validation failed, return dict with message and validation info
             response_message = f"Function saved to {rel_path}"
             logger.warning(f"⚠️ {response_message}")
+            validation_message = syntax_error
+            if missing_description_warning:
+                validation_message = f"{validation_message} {missing_description_warning}"
             return matched_func_name, {
                 "message": response_message,
                 "validationStatus": "ERROR",
-                "validationMessage": syntax_error
+                "validationMessage": validation_message
+            }
+        elif missing_description_warning:
+            response_message = f"Function saved to {rel_path}"
+            logger.warning(f"⚠️ {response_message}")
+            return matched_func_name, {
+                "message": response_message,
+                "validationStatus": "WARNING",
+                "validationMessage": missing_description_warning
             }
         else:
             # If validation succeeded, return plain string
@@ -2189,4 +2288,3 @@ async def {name}():
 
         # Return the code as plain string
         return code
-

@@ -61,7 +61,7 @@ from pydantic import ConfigDict
 from typing import Any, Dict
 from starlette.applications import Starlette
 from starlette.routing import WebSocketRoute, Route
-from starlette.websockets import WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocket
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.middleware import Middleware
@@ -123,6 +123,9 @@ class ToolResult:
     error_message: Optional[str] = None # Human-readable error if is_error=True
 
 
+BUILTIN_NOT_HANDLED = object()
+
+
 # Monkey patch websockets to support larger message sizes globally
 import websockets.asyncio.server
 original_serve = websockets.asyncio.server.serve
@@ -137,6 +140,14 @@ from state import (
     HOST, PORT,
     FUNCTIONS_DIR, SERVERS_DIR, is_shutting_down,
     SERVER_REQUEST_TIMEOUT
+)
+from lobster import (
+    apply_cloud_welcome,
+    get_default_lobster_tools,
+    get_local_tools_if_lobster_mode,
+    handle_local_lobster_tool_call,
+    handle_lobster_socket as lobster_socket_handler,
+    process_mcp_request as lobster_process_mcp_request,
 )
 
 # --- Path Configuration ---
@@ -260,7 +271,7 @@ class DynamicConfigEventHandler(FileSystemEventHandler):
         # Check if the change is relevant (Python file in any watched function dir or JSON file in any watched server dir)
         # Also handle directory changes (for directory deletions/additions)
         is_function_change = any(
-            (event_path.endswith(".py") or event_path.startswith(watched_dir + os.sep)) and
+            (event_path.endswith(".py") or event_path.endswith(".txt") or event_path.startswith(watched_dir + os.sep)) and
             (event_path.startswith(watched_dir + os.sep) or os.path.dirname(event_path) == watched_dir)
             for watched_dir in self.watched_function_dirs
         )
@@ -405,8 +416,7 @@ class DynamicAdditionServer(Server):
         # Store cloud client reference for tool reporting
         self.cloud_client: Optional['ServiceClient'] = None
 
-        # Pseudo tools for local MCP clients (populated dynamically from cloud welcome event)
-        self.pseudo_tools: List[Tool] = []
+        self.lobster_tools: List[Tool] = get_default_lobster_tools()
 
         # Initialize the dynamic function and server managers
         self.function_manager = DynamicFunctionManager(FUNCTIONS_DIR)
@@ -445,30 +455,6 @@ class DynamicAdditionServer(Server):
             raise NotImplementedError("SDK call_tool handler is not used by this server - use WebSocket handlers instead")
 
     # Initialization for function discovery
-    async def initialize(self, params={}):
-
-
-        """Initialize the server, sending a toolsList notification with initial tools"""
-        logger.info(f"{CYAN}🔧 === ENTERING SERVER INITIALIZE METHOD ==={RESET}")
-        logger.info(f"🚀 Server initialized with version {SERVER_VERSION}")
-
-        # Set the server instance in utils module for client logging
-        utils.set_server_instance(self)
-        logger.info("🔌 Dynamic functions utility module initialized")
-
-        tools_list = await self._get_tools_list(caller_context="initialize_method")
-        logger.info(f"{CYAN}🔧 Server initialize method completed.{RESET}")
-        # Return required InitializeResult fields with proper server capabilities
-        return {
-            "protocolVersion": params.get("protocolVersion"),
-            "capabilities": {
-                "tools": {},
-                "prompts": {},
-                "resources": {},
-                "logging": {}
-            },
-            "serverInfo": {"name": self.name, "version": SERVER_VERSION}
-        }
 
     async def send_awaitable_client_command(self,
                                       client_id_for_routing: str,
@@ -477,7 +463,7 @@ class DynamicAdditionServer(Server):
                                       command_data: Optional[Any] = None, # Optional data for the command
                                       seq_num: Optional[int] = None, # Sequence number for client-side ordering
                                       entry_point_name: Optional[str] = None, # Entry point name for logging
-                                      local_pseudo_call: bool = False, # True if this is a pseudo tool call from local client
+                                      local_lobster_call: bool = False, # True if this is a lobster tool call from local client
                                       user: Optional[str] = None, # User who initiated the request
                                       session_id: Optional[str] = None, # Session ID for request isolation
                                       shell_path: Optional[str] = None, # Shell path in command tree for request isolation
@@ -492,17 +478,17 @@ class DynamicAdditionServer(Server):
             command_data → data
             seq_num → seqNum
             entry_point_name → entryPoint
-            local_pseudo_call → localPseudoCall
+            local_lobster_call → localLobsterCall
             shell_path → shellPath
 
         Args:
             client_id_for_routing: The ID of the client to send the command to.
-            request_id: The original MCP request ID, for client-side context (None for pseudo tools).
+            request_id: The original MCP request ID, for client-side context (None for lobster tools).
             command: The command identifier string.
             command_data: Optional data payload for the command.
             seq_num: Optional sequence number for client-side ordering.
             entry_point_name: Optional name of the entry point function for logging.
-            local_pseudo_call: True if this is a pseudo tool call from local client (readme/command).
+            local_lobster_call: True if this is a lobster tool call from local client (readme/command).
             user: Optional user who initiated the request (for request isolation).
             session_id: Optional session ID (for request isolation).
             shell_path: Optional shell path in the command tree (for request isolation).
@@ -600,9 +586,9 @@ class DynamicAdditionServer(Server):
                 if entry_point_name is not None:
                     cloud_notification_params["entryPoint"] = entry_point_name
 
-                # Add localPseudoCall flag if true
-                if local_pseudo_call:
-                    cloud_notification_params["localPseudoCall"] = True
+                # Add localLobsterCall flag if true
+                if local_lobster_call:
+                    cloud_notification_params["localLobsterCall"] = True
 
                 # Add user, sessionId, and shellPath for request context
                 if user is not None:
@@ -836,6 +822,17 @@ class DynamicAdditionServer(Server):
                     if file_path in processed_files:
                         # Already processed this file, skip to avoid duplicates
                         continue
+
+                    # Text files: use metadata from DynamicFunctionManager directly
+                    if file_path.endswith('.txt'):
+                        func_metadata = self.function_manager._function_metadata_by_app.get(app_name, {}).get(func_name)
+                        if func_metadata:
+                            processed_files[file_path] = [func_metadata]
+                            is_valid = True
+                            functions_info = [func_metadata]
+                        else:
+                            processed_files[file_path] = None
+                            continue
                     else:
                         # Load and validate the function code directly from the file
                         full_file_path = os.path.join(FUNCTIONS_DIR, file_path)
@@ -878,7 +875,7 @@ class DynamicAdditionServer(Server):
                             tool_input_schema = func_info.get('inputSchema', {"type": "object", "properties": {}})
                             tool_annotations = {}
 
-                            tool_annotations["type"] = "function"
+                            tool_annotations["type"] = "text_file" if func_info.get('is_text_file') else "function"
                             tool_annotations["validationStatus"] = "VALID"
                             tool_annotations["sourceFile"] = file_path
 
@@ -984,7 +981,7 @@ class DynamicAdditionServer(Server):
         Three scenarios:
         1. Cloud requests tool list (for_local_client=False) → return FULL local tool list
         2. Local requests, NO cloud connection exists → return FULL local tool list
-        3. Local requests, cloud connection EXISTS → return ONLY 'readme' and 'command' proxy tools
+        3. Local requests, cloud connection EXISTS → return welcome tools
         """
         logger.info(f"{BRIGHT_WHITE}📋 === GETTING TOOL LIST (Called by: {caller_context}, for_local_client={for_local_client}) ==={RESET}")
 
@@ -993,39 +990,9 @@ class DynamicAdditionServer(Server):
             global client_connections
             has_cloud_connection = any(info.get("type") == "cloud" for info in client_connections.values())
 
-            if has_cloud_connection:
-                # Scenario 3: Local client + cloud exists → pseudo tools now come from cloud via welcome event
-                # (cloud already knows about these tools, no need to inject them here)
-                logger.info("☁️ Local client request with cloud connection - pseudo tools handled by cloud welcome event")
-                pass
-                # # OLD: hardcoded pseudo tools (now pulled dynamically from welcome event)
-                # return [
-                #     Tool(
-                #         name="readme",
-                #         description="Get information about how to use Atlantis commands",
-                #         inputSchema={"type": "object", "properties": {}},
-                #         annotations=ToolAnnotations(title="readme")
-                #     ),
-                #     Tool(
-                #         name="command",
-                #         description="Execute an Atlantis command on the connected cloud",
-                #         inputSchema={
-                #             "type": "object",
-                #             "properties": {
-                #                 "content": {
-                #                     "type": "string",
-                #                     "description": "The Atlantis command to execute"
-                #                 },
-                #                 "params": {
-                #                     "type": "object",
-                #                     "description": "Additional params for the Atlantis command as needed"
-                #                 }
-                #             },
-                #             "required": ["content"]
-                #         },
-                #         annotations=ToolAnnotations(title="command")
-                #     )
-                # ]
+            lobster_tools = get_local_tools_if_lobster_mode(self, has_cloud_connection)
+            if lobster_tools is not None:
+                return lobster_tools
 
         # Scenarios 1 & 2: Return full local tool list
         # - Cloud requesting tools (for_local_client=False)
@@ -1076,12 +1043,13 @@ class DynamicAdditionServer(Server):
         tools_list = [
             Tool(
                 name="_function_set",
-                description="Sets the content of a dynamic Python function. Use 'app' parameter to target specific functions when multiple exist with the same name.", # Updated description
+                description="Sets the content of a dynamic function or text file. Use 'name' to explicitly target the existing function/file to update, and use 'app' to disambiguate functions with the same name in different apps.",
                 inputSchema={
                     "type": "object",
                     "properties": {
+                        "name": {"type": "string", "description": "Optional but recommended: The existing function/file name to update. Required for .txt files (e.g. 'foo.txt')."},
                         "app": {"type": "string", "description": "Optional: The app name to target a specific function when multiple exist with the same name"},
-                        "code": {"type": "string", "description": "The Python source code containing a single function definition."}
+                        "code": {"type": "string", "description": "The source code (Python) or text content (.txt files)."}
                     },
                     "required": ["code"] # Only code is required now
                 },
@@ -1121,7 +1089,8 @@ class DynamicAdditionServer(Server):
                     "properties": {
                         "app": {"type": "string", "description": "Optional: The app name to create the function in a specific app directory"},
                         "name": {"type": "string", "description": "The name to register the new placeholder function under."},
-                        "location": {"type": "string", "description": "Optional: Adds @location() decorator with the specified location value to the generated function."}
+                        "location": {"type": "string", "description": "Optional: Adds @location() decorator with the specified location value to the generated function."},
+                        "comment": {"type": "string", "description": "Optional: Custom comment for the function's docstring. Defaults to a placeholder message if not provided."}
                     },
                     "required": ["name"]
                 },
@@ -2051,6 +2020,759 @@ class DynamicAdditionServer(Server):
             logger.debug(f"Log notification error details: {traceback.format_exc()}")
             # We intentionally don't re-raise here
 
+    async def _authorize_tool_call(
+        self,
+        actual_function_name: str,
+        args: dict,
+        parsed_app_name: Optional[str],
+        client_id: Optional[str],
+        request_id: Optional[str],
+        user: Optional[str],
+    ) -> List[str]:
+        decorators_list: List[str] = []
+
+        # Security check: Special handling for _function_get with @copy decorator
+        if actual_function_name == "_function_get":
+            caller = user or client_id or "unknown"
+            is_localhost = caller.startswith("ws_127.0.0.1_")
+
+            if is_localhost or atlantis.is_owner(caller):
+                logger.debug(f"✅ _function_get authorized for owner: {caller}")
+                return decorators_list
+
+            target_func_name = args.get("name")
+            target_app_name = args.get("app")
+
+            if not target_func_name:
+                logger.warning(f"🚨 SECURITY: Non-owner '{caller}' tried _function_get without target function")
+                raise ValueError("Access denied: _function_get requires owner (no target function specified)")
+
+            app_path = self.function_manager._app_name_to_path(target_app_name) if target_app_name else None
+            target_metadata = self.function_manager._function_metadata_by_app.get(app_path, {}).get(target_func_name)
+
+            if not target_metadata:
+                logger.warning(f"🚨 SECURITY: Non-owner '{caller}' tried _function_get for unknown function '{target_func_name}'")
+                raise ValueError(f"Access denied: Function '{target_func_name}' not found")
+
+            is_copyable = target_metadata.get('is_copyable', False)
+            if not is_copyable:
+                logger.warning(f"🚨 SECURITY: Non-owner '{caller}' tried to copy '{target_func_name}' without @copy decorator")
+                raise ValueError(f"Access denied: Function '{target_func_name}' is not copyable (missing @copy decorator)")
+
+            decorators_list = target_metadata.get('decorators', [])
+
+            if 'public' in decorators_list:
+                logger.debug(f"✅ _function_get authorized for '{target_func_name}' (@copy + @public) by caller: {caller}")
+            elif 'protected' in decorators_list:
+                protection_name = target_metadata.get('protection_name')
+                if not protection_name:
+                    logger.warning(f"🚨 SECURITY: Function '{target_func_name}' has @protected but no protection function")
+                    raise ValueError(f"Access denied: Function '{target_func_name}' has @protected but no protection function")
+
+                logger.debug(f"🔒 _function_get for '{target_func_name}' (@copy + @protected) - calling protection function: {protection_name}")
+
+                try:
+                    is_allowed = await self.function_manager.function_call(
+                        name=protection_name,
+                        client_id=client_id,
+                        request_id=request_id,
+                        user=user,
+                        app=None,
+                        args={'user': user}
+                    )
+
+                    if not is_allowed:
+                        logger.warning(f"🚨 SECURITY: Protection function '{protection_name}' denied _function_get for '{target_func_name}' by user '{user}'")
+                        raise PermissionError(f"Access denied: User '{user}' not authorized to copy '{target_func_name}'")
+
+                    logger.debug(f"✅ _function_get authorized for '{target_func_name}' via protection function '{protection_name}'")
+                except PermissionError:
+                    raise
+                except Exception as prot_err:
+                    logger.error(f"❌ Error executing protection function '{protection_name}' for _function_get: {prot_err}")
+                    raise PermissionError(f"Access denied: Error checking authorization for '{target_func_name}'") from prot_err
+            else:
+                logger.warning(f"🚨 SECURITY: Non-owner '{caller}' tried to copy owner-only function '{target_func_name}' (has @copy but not @public/@protected)")
+                raise ValueError(f"Access denied: Function '{target_func_name}' is owner-only (@copy requires @public or @protected for non-owner access)")
+
+            return decorators_list
+
+        # Security check: Only owner can call other internal functions
+        if (
+            actual_function_name.startswith('_function')
+            or actual_function_name.startswith('_server')
+            or actual_function_name.startswith('_admin')
+        ):
+            caller = user or client_id or "unknown"
+            is_localhost = caller.startswith("ws_127.0.0.1_")
+
+            if not is_localhost and not atlantis.is_owner(caller):
+                logger.warning(f"🚨 SECURITY: Internal function '{actual_function_name}' called by '{caller}' but owner usernames are '{atlantis.get_owner_usernames()}' - ACCESS DENIED")
+                raise ValueError("Access denied: Internal functions can only be accessed by owner")
+
+            logger.debug(f"✅ Internal function '{actual_function_name}' authorized for owner: {caller}")
+            return decorators_list
+
+        # Non-internal function: validate it has a required decorator and check access
+        await self.function_manager._build_function_file_mapping()
+        app_path = self.function_manager._app_name_to_path(parsed_app_name) if parsed_app_name else None
+        func_metadata = self.function_manager._function_metadata_by_app.get(app_path, {}).get(actual_function_name)
+
+        if not func_metadata:
+            logger.warning(f"⚠️ Function '{actual_function_name}' not found in metadata cache")
+            return decorators_list
+
+        decorators_list = func_metadata.get('decorators', [])
+        has_required_decorator = any(dec in decorators_list for dec in VISIBILITY_DECORATORS)
+
+        if not has_required_decorator:
+            error_msg = f"Access denied: Function '{actual_function_name}' cannot be called remotely without a visibility decorator"
+            logger.warning(f"🚨 SECURITY: {error_msg}")
+            raise PermissionError(error_msg)
+
+        is_public = 'public' in decorators_list
+        is_index = 'index' in decorators_list
+        is_protected = 'protected' in decorators_list
+
+        if is_public or is_index:
+            decorator_type = '@index' if is_index else '@public'
+            logger.debug(f"✅ Public function '{actual_function_name}' ({decorator_type}) accessible to caller: {user or client_id or 'unknown'}")
+        elif is_protected:
+            logger.debug(f"🔒 Protected function '{actual_function_name}' - access will be validated by protection function")
+        else:
+            caller = user or client_id or "unknown"
+            is_localhost = caller.startswith("ws_127.0.0.1_")
+
+            if not is_localhost and not atlantis.is_owner(caller):
+                logger.warning(f"🚨 SECURITY: Owner-only function '{actual_function_name}' called by '{caller}' but owner usernames are '{atlantis.get_owner_usernames()}' - ACCESS DENIED")
+                raise PermissionError(f"Access denied: Function '{actual_function_name}' can only be accessed by owner")
+
+            logger.debug(f"✅ Function '{actual_function_name}' authorized for owner: {caller}")
+
+        logger.debug(f"✅ Function '{actual_function_name}' has valid decorator(s): {decorators_list}")
+        return decorators_list
+
+    async def _execute_builtin_tool(
+        self,
+        actual_function_name: str,
+        args: dict,
+        client_id: Optional[str],
+        request_id: Optional[str],
+        user: Optional[str],
+        session_id: Optional[str],
+    ) -> Any:
+        if actual_function_name == "_function_set":
+            logger.debug(f"---> Calling built-in: function_set")
+            extracted_name, result_messages = await self.function_manager.function_set(args, self)
+            if extracted_name:
+                await self._notify_tool_list_changed(change_type="updated", tool_name=extracted_name)
+            return result_messages
+        elif actual_function_name == "_function_get":
+            logger.debug(f"---> Calling built-in: get_function_code")
+            return await self.function_manager.get_function_code(args, self)
+        elif actual_function_name == "_function_remove":
+            func_name = args.get("name")
+            app_name = args.get("app")
+            if not func_name:
+                raise ValueError("Missing required parameter: name")
+
+            logger.debug(f"---> Calling built-in: function_remove for '{func_name}'" + (f" (app: {app_name})" if app_name else ""))
+            function_file = await self.function_manager._find_file_containing_function(func_name, app_name)
+
+            if not function_file:
+                if app_name:
+                    raise ValueError(f"Function '{func_name}' does not exist in app '{app_name}'.")
+                raise ValueError(f"Function '{func_name}' does not exist.")
+
+            await self.function_manager.function_remove(func_name, app_name)
+            try:
+                await self._notify_tool_list_changed(change_type="removed", tool_name=func_name)
+            except Exception as e:
+                logger.error(f"Error sending tool notification after removing {func_name}: {str(e)}")
+            return f"Function '{func_name}' removed successfully."
+        elif actual_function_name == "_function_add":
+            logger.debug(f"---> Calling built-in: function_add with args:\n{format_json_log(args)}")
+
+            func_name = args.get("name")
+            app_name = args.get("app")
+            location_value = args.get("location")
+            comment_value = args.get("comment")
+            if not func_name:
+                raise ValueError("Missing required parameter: name")
+
+            function_file = await self.function_manager._find_file_containing_function(func_name, app_name)
+
+            if function_file:
+                existing_locations = []
+                if not app_name:
+                    for existing_app_path, app_functions in self.function_manager._function_file_mapping_by_app.items():
+                        if func_name in app_functions:
+                            filename = app_functions[func_name]
+                            if existing_app_path is None:
+                                location = f"root {filename}"
+                            else:
+                                existing_app_display = self.function_manager._path_to_app_name(existing_app_path)
+                                location = f"{existing_app_display} {filename}"
+                            existing_locations.append(location)
+
+                if app_name:
+                    return f"Function '{func_name}' already exists in app '{app_name}'."
+                if existing_locations:
+                    if len(existing_locations) == 1:
+                        return f"Function '{func_name}' already exists in {existing_locations[0]}."
+                    locations_list = ", ".join(existing_locations)
+                    return f"Function '{func_name}' already exists in: {locations_list}. Specify an app parameter."
+                return f"Function '{func_name}' already exists."
+
+            await self.function_manager.function_add(func_name, None, app_name, location_value, comment_value)
+            try:
+                await self._notify_tool_list_changed(change_type="added", tool_name=func_name)
+            except Exception as e:
+                logger.error(f"Error sending tool notification after adding {func_name}: {str(e)}")
+            if app_name:
+                return f"Empty function '{func_name}' created successfully in app '{app_name}'."
+            return f"Empty function '{func_name}' created successfully in root."
+        elif actual_function_name == "_function_move":
+            logger.debug(f"---> Calling built-in: function_move with args:\n{format_json_log(args)}")
+
+            source_name = args.get("source_name")
+            source_app = args.get("source_app")
+            dest_app = args.get("dest_app")
+            dest_name = args.get("dest_name")
+            dest_location = args.get("dest_location")
+
+            if not source_name:
+                raise ValueError("Missing required parameter: source_name")
+            if not dest_app:
+                raise ValueError("Missing required parameter: dest_app")
+
+            try:
+                result_msg = await self.function_manager.function_move(
+                    source_name, source_app, dest_app, dest_name, dest_location
+                )
+                final_name = dest_name or source_name
+                await self._notify_tool_list_changed(change_type="updated", tool_name=final_name)
+                return result_msg
+            except (ValueError, IOError) as e:
+                return str(e)
+        elif actual_function_name == "_server_get":
+            svc_name = args.get("name")
+            if not svc_name:
+                raise ValueError("Missing required parameter: name")
+            logger.debug(f"---> Calling built-in: server_get for '{svc_name}'")
+            return await self.server_manager.server_get(svc_name)
+        elif actual_function_name == "_server_add":
+            svc_name = args.get("name")
+            if not svc_name:
+                raise ValueError("Missing required parameter: 'name' must be a string")
+            logger.debug(f"---> Calling built-in: server_add for '{svc_name}'")
+            success = await self.server_manager.server_add(svc_name)
+            if success:
+                try:
+                    await self._notify_tool_list_changed(change_type="added", tool_name=svc_name)
+                except Exception as e:
+                    logger.error(f"Error sending tool notification after adding server {svc_name}: {str(e)}")
+                return f"MCP '{svc_name}' added successfully."
+            return f"Failed to add MCP '{svc_name}'."
+        elif actual_function_name == "_server_remove":
+            svc_name = args.get("name")
+            if not svc_name:
+                raise ValueError("Missing required parameter: name")
+            logger.debug(f"---> Calling built-in: server_remove for '{svc_name}'")
+            success = await self.server_manager.server_remove(svc_name)
+            if success:
+                try:
+                    await self._notify_tool_list_changed(change_type="removed", tool_name=svc_name)
+                except Exception as e:
+                    logger.error(f"Error sending tool notification after removing server {svc_name}: {str(e)}")
+                return f"Server '{svc_name}' removed successfully."
+            return f"Failed to remove server '{svc_name}'."
+        elif actual_function_name == "_server_set":
+            logger.debug(f"---> Calling built-in: server_set with args:\n{format_json_log(args)}")
+            config = args.get("config")
+            if not config:
+                raise ValueError("Missing required parameter: config")
+
+            try:
+                server_name = self.server_manager.extract_server_name(config)
+                if not server_name:
+                    raise ValueError("Failed to get server name")
+            except Exception as e:
+                logger.warning(f"Could not parse config as JSON: {e}")
+                server_name = args.get('name')
+                if not server_name:
+                    raise ValueError("Unable to resolve server name")
+
+            result_raw = await self.server_manager.server_set(server_name, config)
+            if result_raw:
+                try:
+                    await self._notify_tool_list_changed(change_type="updated", tool_name=server_name)
+                except Exception as e:
+                    logger.error(f"Error sending tool notification after updating server {server_name}: {str(e)}")
+            return result_raw
+        elif actual_function_name == "_server_validate":
+            svc_name = args.get("name")
+            if not svc_name:
+                raise ValueError("Missing required parameter: name")
+            logger.debug(f"---> Calling built-in: server_validate for '{svc_name}'")
+            return await self.server_manager.server_validate(svc_name)
+        elif actual_function_name == "_server_start":
+            logger.debug(f"---> Calling built-in: server_start with args:\n{format_json_log(args)}")
+            result_raw = await self.server_manager.server_start(args, self)
+            server_name = args.get('name')
+            if server_name:
+                try:
+                    task_info = self.server_manager.server_tasks.get(server_name)
+                    if task_info and 'ready_event' in task_info:
+                        logger.debug(f"Waiting for server '{server_name}' to be ready before sending notification...")
+                        await asyncio.wait_for(task_info['ready_event'].wait(), timeout=30.0)
+                        logger.info(f"Server '{server_name}' is ready, invalidating cache and regenerating tool list")
+                        self._cached_tools = None
+                        updated_tools = await self._get_tools_list(caller_context=f"after_server_start:{server_name}")
+                        logger.info(f"📊 Reporting updated tool list after MCP server '{server_name}' started...")
+                        await self.cloud_client._report_tools_to_console(tools_list=updated_tools)
+                        logger.info(f"Sending tool list change notification for '{server_name}'")
+                        await self._notify_tool_list_changed(change_type="updated", tool_name=server_name)
+                    else:
+                        logger.warning(f"No ready_event found for server '{server_name}', skipping notification wait")
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout waiting for server '{server_name}' to be ready, sending notification anyway")
+                    await self._notify_tool_list_changed(change_type="updated", tool_name=server_name)
+                except Exception as e:
+                    logger.error(f"Error sending tool notification after starting server {server_name}: {str(e)}")
+            return result_raw
+        elif actual_function_name == "_server_stop":
+            logger.debug(f"---> Calling built-in: server_stop with args:\n{format_json_log(args)}")
+            result_raw = await self.server_manager.server_stop(args, self)
+            server_name = args.get('name')
+            if server_name:
+                try:
+                    logger.info(f"Server '{server_name}' stopped, invalidating cache and regenerating tool list")
+                    self._cached_tools = None
+                    updated_tools = await self._get_tools_list(caller_context=f"after_server_stop:{server_name}")
+                    logger.info(f"📊 Reporting updated tool list after MCP server '{server_name}' stopped...")
+                    await self.cloud_client._report_tools_to_console(tools_list=updated_tools)
+                    logger.info(f"Sending tool list change notification for '{server_name}'")
+                    await self._notify_tool_list_changed(change_type="updated", tool_name=server_name)
+                except Exception as e:
+                    logger.error(f"Error sending tool notification after stopping server {server_name}: {str(e)}")
+            return result_raw
+        elif actual_function_name == "_server_get_tools":
+            server_name = args.get('name')
+            if not server_name or not isinstance(server_name, str):
+                raise ValueError("Missing or invalid 'name' argument for _server_get_tools")
+            was_running = await self.server_manager.is_server_running(server_name)
+            result_raw = await self.server_manager.get_server_tools(server_name)
+            if not was_running:
+                is_running_now = await self.server_manager.is_server_running(server_name)
+                if is_running_now:
+                    logger.info(f"Server '{server_name}' was auto-started by get_server_tools")
+                    try:
+                        logger.info(f"Invalidating cache and regenerating tool list after auto-start")
+                        self._cached_tools = None
+                        updated_tools = await self._get_tools_list(caller_context=f"after_autostart:{server_name}")
+                        logger.info(f"📊 Reporting updated tool list after MCP server '{server_name}' auto-started...")
+                        await self.cloud_client._report_tools_to_console(tools_list=updated_tools)
+                        logger.info(f"Sending tool list change notification for '{server_name}'")
+                        await self._notify_tool_list_changed(change_type="updated", tool_name=server_name)
+                    except Exception as e:
+                        logger.error(f"Error sending tool notification after auto-starting server {server_name}: {str(e)}")
+            if result_raw and isinstance(result_raw, list):
+                return [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "inputSchema": tool.inputSchema
+                    }
+                    for tool in result_raw
+                ]
+            return result_raw
+        elif actual_function_name == "_function_history":
+            app_name = args.get("app")
+            function_name = args.get("name")
+            logger.debug(f"---> Calling built-in: _function_history (app: {app_name}, function: {function_name})")
+            if not function_name:
+                raise ValueError("Missing required parameter: name")
+
+            try:
+                function_file = await self.function_manager._find_file_containing_function(function_name, app_name)
+                if not function_file:
+                    raise ValueError(f"Function '{function_name}' not found in app '{app_name or '(root)'}'")
+            except Exception as e:
+                raise ValueError(f"Function '{function_name}' not found in app '{app_name or '(root)'}': {e}")
+
+            if not os.path.exists(TOOL_CALL_LOG_PATH):
+                return []
+
+            try:
+                with open(TOOL_CALL_LOG_PATH, "r", encoding="utf-8") as f:
+                    log_entries = [json.loads(line) for line in f if line.strip()]
+
+                return [
+                    entry for entry in log_entries
+                    if (entry.get("tool_name") == function_name and entry.get("app_name") == (app_name if app_name else ""))
+                ]
+            except (json.JSONDecodeError, IOError) as e:
+                logger.error(f"Error reading or parsing tool_call_log.json: {e}")
+                raise ValueError(f"Error accessing function history: {e}")
+        elif actual_function_name == "_function_log":
+            app_name = args.get("app")
+            logger.debug("---> Calling built-in: _function_log" + (f" (app: {app_name})" if app_name else ""))
+            if not os.path.exists(OWNER_LOG_PATH):
+                return []
+
+            try:
+                with open(OWNER_LOG_PATH, "r", encoding="utf-8") as f:
+                    file_content = f.read()
+                    if not file_content.strip():
+                        return []
+                    return json.loads(file_content)
+            except (json.JSONDecodeError, IOError) as e:
+                logger.error(f"Error reading or parsing owner log: {e}")
+                raise ValueError(f"Error accessing function history: {e}")
+        elif actual_function_name == "_admin_restart":
+            logger.info(f"🔄 ADMIN RESTART requested by owner: {user or 'unknown'}")
+
+            async def delayed_shutdown():
+                await asyncio.sleep(0.1)
+                logger.info("🛑 Sending SIGINT for graceful restart...")
+                os.kill(os.getpid(), signal.SIGINT)
+
+            asyncio.create_task(delayed_shutdown())
+            return "Server restart initiated. The process will terminate and should be restarted by wrapper script."
+        elif actual_function_name == "_admin_pip_install":
+            package = args.get("package")
+            force = False
+
+            if not package:
+                raise ValueError("Missing required parameter: package")
+
+            logger.info(f"📦 ADMIN PIP INSTALL requested by owner: {user or 'unknown'} - Package: {package}")
+
+            pip_cmd = [sys.executable, "-m", "pip", "install", package]
+            if force:
+                pip_cmd.append("--force-reinstall")
+
+            try:
+                result = subprocess.run(
+                    pip_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+
+                if result.returncode == 0:
+                    success_msg = f"✅ Successfully installed package: {package}"
+                    if result.stdout:
+                        success_msg += f"\n\nOutput:\n{result.stdout}"
+                    logger.info(f"📦 Package '{package}' installed successfully")
+                    return success_msg
+
+                error_msg = f"❌ Failed to install package: {package}"
+                if result.stderr:
+                    error_msg += f"\n\nError output:\n{result.stderr}"
+                if result.stdout:
+                    error_msg += f"\n\nStdout:\n{result.stdout}"
+                logger.error(f"📦 Failed to install package '{package}': {result.stderr}")
+                raise RuntimeError(error_msg)
+            except subprocess.TimeoutExpired:
+                timeout_msg = f"⏰ Pip install timed out after 5 minutes for package: {package}"
+                logger.error(f"📦 Pip install timeout for package '{package}'")
+                raise TimeoutError(timeout_msg)
+            except Exception as e:
+                if isinstance(e, (RuntimeError, TimeoutError)):
+                    raise
+                error_msg = f"💥 Error during pip install for package '{package}': {str(e)}"
+                logger.error(f"📦 Pip install error for package '{package}': {str(e)}")
+                raise RuntimeError(error_msg) from e
+        elif actual_function_name == "_public_click":
+            key = args.get("key")
+            if not key:
+                raise ValueError("Missing required parameter: key")
+
+            logger.info(f"🖱️ PUBLIC CLICK: {user} clicked key: {key}")
+            callback = atlantis._click_callbacks.get(key)
+            logger.info(f"🖱️ Available callback keys: {list(atlantis._click_callbacks.keys())}")
+
+            if callback:
+                logger.info(f"🖱️ Found callback for key '{key}', invoking as dynamic function...")
+                wrapper_name = f"_click_callback_{key.replace('-', '_').replace('.', '_')}"
+                setattr(atlantis, wrapper_name, callback)
+
+                try:
+                    return await self.function_manager.function_call(
+                        name=wrapper_name,
+                        client_id=client_id,
+                        request_id=request_id,
+                        user=user,
+                        session_id=session_id,
+                        app=None,
+                        args={}
+                    )
+                finally:
+                    if hasattr(atlantis, wrapper_name):
+                        delattr(atlantis, wrapper_name)
+
+            logger.info(f"🖱️ No callback found for key '{key}'")
+            return f"🖱️ Click received for key '{key}' but no callback registered"
+        elif actual_function_name == "_public_upload":
+            key = args.get("key")
+            filename = args.get("filename")
+            filetype = args.get("filetype")
+            base64Content = args.get("base64Content")
+
+            if not key:
+                raise ValueError("Missing required parameter: key")
+            if not filename:
+                raise ValueError("Missing required parameter: filename")
+            if not filetype:
+                raise ValueError("Missing required parameter: filetype")
+            if not base64Content:
+                raise ValueError("Missing required parameter: base64Content")
+
+            logger.info(f"🖱️ PUBLIC UPLOAD: {user} uploading id: {key}, filename: {filename}, filetype: {filetype}")
+            callback = atlantis._upload_callbacks.get(key)
+            logger.info(f"🖱️ Available callback keys: {list(atlantis._upload_callbacks.keys())}")
+
+            if callback:
+                logger.info(f"🖱️ Found callback for key '{key}', invoking as dynamic function...")
+                wrapper_name = f"_upload_callback_{key.replace('-', '_').replace('.', '_')}"
+                setattr(atlantis, wrapper_name, callback)
+
+                try:
+                    return await self.function_manager.function_call(
+                        name=wrapper_name,
+                        client_id=client_id,
+                        request_id=request_id,
+                        user=user,
+                        session_id=session_id,
+                        app=None,
+                        args={"filename": filename, "filetype": filetype, "base64Content": base64Content}
+                    )
+                finally:
+                    if hasattr(atlantis, wrapper_name):
+                        delattr(atlantis, wrapper_name)
+
+            logger.info(f"🖱️ No callback found for key '{key}'")
+            return f"🖱️ Upload received for key '{key}' but no callback registered"
+        elif actual_function_name == "_admin_app_create":
+            app_name = args.get("appName")
+            if not app_name:
+                raise ValueError("Missing required parameter: appName")
+
+            logger.info(f"📁 ADMIN APP CREATE requested by owner: {user or 'unknown'} - App: {app_name}")
+            app_path = self.function_manager._app_name_to_path(app_name)
+            if app_path is None:
+                raise ValueError("Missing required parameter: appName")
+            target_dir = os.path.join(self.function_manager.functions_dir, app_path)
+            main_py_path = os.path.join(target_dir, "main.py")
+
+            if os.path.exists(main_py_path):
+                error_msg = f"App '{app_name}' already exists at {app_path}/main.py"
+                logger.warning(f"❌ App create failed: {error_msg}")
+                raise ValueError(error_msg)
+
+            function_name = "index"
+            index_stub = """\
+import atlantis
+import logging
+
+logger = logging.getLogger("mcp_server")
+
+
+@visible
+@index
+async def index():
+    \"\"\"
+    This is the entry point for the app
+    \"\"\"
+    logger.info("Executing app index function...")
+
+    await atlantis.client_log("index running")
+
+    # Replace this return statement with your function's result
+    return "App index executed successfully."
+
+"""
+            await self.function_manager.function_add(function_name, index_stub, app_name)
+            try:
+                await self._notify_tool_list_changed(change_type="added", tool_name=function_name)
+            except Exception as e:
+                logger.error(f"Error sending tool notification after adding {function_name}: {str(e)}")
+            return f"✅ Successfully created app '{app_name}' with main.py containing {function_name}() function"
+        elif actual_function_name == "_admin_git_update":
+            remote = args.get("remote", "origin")
+            branch = args.get("branch", "main")
+
+            logger.info(f"🔄 ADMIN GIT UPDATE requested by owner: {user or 'unknown'} - Remote: {remote}, Branch: {branch}")
+
+            try:
+                fetch_result = subprocess.run(
+                    ["git", "fetch", remote],
+                    capture_output=True,
+                    text=True,
+                    cwd=os.path.dirname(os.path.abspath(__file__))
+                )
+
+                if fetch_result.returncode != 0:
+                    error_msg = f"❌ Git fetch failed: {fetch_result.stderr.strip()}"
+                    logger.error(f"🔄 Git fetch error: {error_msg}")
+                    raise RuntimeError(error_msg)
+
+                merge_result = subprocess.run(
+                    ["git", "merge", f"{remote}/{branch}"],
+                    capture_output=True,
+                    text=True,
+                    cwd=os.path.dirname(os.path.abspath(__file__))
+                )
+
+                if merge_result.returncode != 0:
+                    error_msg = f"❌ Git merge failed: {merge_result.stderr.strip()}"
+                    logger.error(f"🔄 Git merge error: {error_msg}")
+                    raise RuntimeError(error_msg)
+
+                success_msg = f"✅ Successfully updated from {remote}/{branch}"
+                if merge_result.stdout.strip():
+                    success_msg += f"\n{merge_result.stdout.strip()}"
+                logger.info(f"🔄 Git update successful: {success_msg}")
+                return success_msg
+            except Exception as e:
+                if isinstance(e, RuntimeError):
+                    raise
+                error_msg = f"❌ Git update failed with exception: {str(e)}"
+                logger.error(f"🔄 Git update exception: {error_msg}")
+                raise RuntimeError(error_msg) from e
+        elif (
+            actual_function_name.startswith('_function')
+            or actual_function_name.startswith('_server')
+            or actual_function_name.startswith('_admin')
+            or actual_function_name.startswith('_public')
+        ):
+            return f"Invalid internal function: '{actual_function_name}'. Check available internal functions."
+
+        return BUILTIN_NOT_HANDLED
+
+    async def _execute_proxy_tool(self, name: str, actual_function_name: str, args: dict) -> ToolResult:
+        logger.info(f"🌐 MCP TOOL CALL: {actual_function_name}")
+        server_alias, tool_name_on_server = re.split('[. ]', actual_function_name, 1)
+        logger.debug(f"Parsed: Server Alias='{server_alias}', Remote Tool='{tool_name_on_server}'")
+
+        if server_alias not in self._server_configs:
+            raise ValueError(f"Unknown server alias: '{server_alias}'")
+        if not await self.server_manager.is_server_running(server_alias):
+            raise ValueError(f"Server '{server_alias}' is not running.")
+
+        task_info = self.server_manager.server_tasks.get(server_alias)
+        if not task_info:
+            raise ValueError(f"Could not find task info for running server '{server_alias}'.")
+
+        session = task_info.get('session')
+        ready_event = task_info.get('ready_event')
+
+        if not session and ready_event:
+            session_ready_timeout = 5.0
+            logger.debug(f"Session for '{server_alias}' not immediately ready for proxy call. Waiting up to {session_ready_timeout}s...")
+            try:
+                await asyncio.wait_for(ready_event.wait(), timeout=session_ready_timeout)
+                session = task_info.get('session')
+                if not session:
+                    raise ValueError(f"Server '{server_alias}' session not available even after waiting.")
+                logger.debug(f"Session for '{server_alias}' became ready.")
+            except asyncio.TimeoutError:
+                raise ValueError(f"Timeout waiting for server '{server_alias}' session to become ready for proxy call.")
+        elif not session:
+            raise ValueError(f"Server '{server_alias}' is running but its session is not available and cannot wait (no ready_event).")
+
+        try:
+            logger.info(f"🌐 PROXYING tool call '{tool_name_on_server}' to server '{server_alias}' with args: {args}")
+            proxy_response: CallToolResult = await asyncio.wait_for(
+                session.call_tool(tool_name_on_server, args or {}),
+                timeout=SERVER_REQUEST_TIMEOUT
+            )
+            logger.info(f"✅ PROXY response received from '{server_alias}'")
+            logger.debug(f"Raw Proxy Response: {proxy_response}")
+
+            proxy_value = None
+            if hasattr(proxy_response, 'structuredContent') and proxy_response.structuredContent is not None:
+                proxy_value = proxy_response.structuredContent
+                logger.debug(f"Using structuredContent from proxied response")
+            elif proxy_response.content and isinstance(proxy_response.content, list):
+                if len(proxy_response.content) == 1 and hasattr(proxy_response.content[0], 'text'):
+                    try:
+                        proxy_value = json.loads(proxy_response.content[0].text)
+                    except (json.JSONDecodeError, TypeError):
+                        proxy_value = proxy_response.content[0].text
+                else:
+                    proxy_value = [getattr(c, 'text', str(c)) for c in proxy_response.content]
+                logger.debug(f"Extracted value from proxied content: {type(proxy_value)}")
+            else:
+                error_message = f"Proxied server '{server_alias}' returned unexpected content format: {proxy_response.content}"
+                logger.error(error_message)
+                raise ValueError(error_message)
+
+            is_error = getattr(proxy_response, 'isError', False)
+            logger.debug(f"<--- _execute_tool RETURNING proxied result as ToolResult.")
+            return ToolResult(value=proxy_value, is_error=is_error)
+        except McpError as mcp_err:
+            logger.error(f"❌ MCPError proxying tool call '{name}' to '{server_alias}': {mcp_err}", exc_info=True)
+            error_message = f"Error calling '{tool_name_on_server}' on server '{server_alias}': {mcp_err.message} (Code: {mcp_err.code})"
+            raise ValueError(error_message) from mcp_err
+        except asyncio.TimeoutError:
+            logger.error(f"❌ Timeout proxying tool call '{name}' to '{server_alias}'.")
+            raise ValueError(f"Timeout calling '{tool_name_on_server}' on server '{server_alias}'.")
+        except Exception as proxy_err:
+            logger.error(f"❌ Unexpected error proxying tool call '{name}' to '{server_alias}': {proxy_err}", exc_info=True)
+            raise ValueError(f"Unexpected error calling '{tool_name_on_server}' on server '{server_alias}': {proxy_err}") from proxy_err
+
+    async def _execute_dynamic_tool(
+        self,
+        name: str,
+        actual_function_name: str,
+        args: dict,
+        parsed_app_name: Optional[str],
+        decorators_list: List[str],
+        client_id: Optional[str],
+        request_id: Optional[str],
+        user: Optional[str],
+        session_id: Optional[str],
+        command_seq: Optional[int],
+        shell_path: Optional[str],
+    ) -> Any:
+        logger.info(f"🔧 CALLING LOCAL DYNAMIC FUNCTION: {name}")
+
+        if name in _runtime_errors:
+            load_error_info = _runtime_errors[name]
+            logger.warning(f"❌ Function '{name}' has a cached load error: {load_error_info['error']}")
+
+        try:
+            logger.info(f"RECEIVED FROM CLOUD: Tool: '{name}', Type: {type(args)}, User: {user}")
+            if isinstance(args, dict):
+                logger.info(f"Args:\n{format_json_log(args, colored=True)}")
+            else:
+                logger.info(f"Args: {args!r}")
+            logger.debug(f"---> Calling dynamic: function_call for '{actual_function_name}' with args: {args} and client_id: {client_id} and request_id: {request_id}, user: {user}")
+            final_args = args.copy() if args else {}
+            result_raw = await self.function_manager.function_call(
+                name=actual_function_name,
+                client_id=client_id,
+                request_id=request_id,
+                user=user,
+                session_id=session_id,
+                command_seq=command_seq,
+                shell_path=shell_path,
+                app=parsed_app_name,
+                args=final_args,
+            )
+            logger.debug(f"<--- Dynamic function '{name}' RAW result: {result_raw} (type: {type(result_raw)})")
+
+            if 'text' in decorators_list and result_raw is not None and not isinstance(result_raw, str):
+                logger.error(f"🚨 @text function '{actual_function_name}' returned {type(result_raw).__name__} instead of str - coercing to string")
+                result_raw = str(result_raw)
+
+            return result_raw
+        except Exception:
+            raise
+
     async def _execute_tool(self, name: str, args: dict, client_id: Optional[str] = None, request_id: Optional[str] = None, user: Optional[str] = None, session_id: Optional[str] = None, command_seq: Optional[int] = None, shell_path: Optional[str] = None) -> ToolResult:
         """Core logic to handle a tool call. Returns ToolResult with raw value.
 
@@ -2095,872 +2817,54 @@ class DynamicAdditionServer(Server):
         # --- END TOOL CALL LOGGING ---
 
         try:
-            result_raw = None # Initialize raw result variable
+            decorators_list = await self._authorize_tool_call(
+                actual_function_name=actual_function_name,
+                args=args,
+                parsed_app_name=parsed_app_name,
+                client_id=client_id,
+                request_id=request_id,
+                user=user,
+            )
 
-            # Security check: Special handling for _function_get with @copy decorator
-            if actual_function_name == "_function_get":
-                caller = user or client_id or "unknown"
+            result_raw = await self._execute_builtin_tool(
+                actual_function_name=actual_function_name,
+                args=args,
+                client_id=client_id,
+                request_id=request_id,
+                user=user,
+                session_id=session_id,
+            )
 
-                # Treat localhost websocket connections as the owner
-                is_localhost = caller.startswith("ws_127.0.0.1_")
-
-                # Owner can always use _function_get
-                if is_localhost or atlantis.is_owner(caller):
-                    logger.debug(f"✅ _function_get authorized for owner: {caller}")
-                else:
-                    # Non-owner trying to use _function_get - check if target has @copy
-                    target_func_name = args.get("name")
-                    target_app_name = args.get("app")
-
-                    if not target_func_name:
-                        logger.warning(f"🚨 SECURITY: Non-owner '{caller}' tried _function_get without target function")
-                        raise ValueError("Access denied: _function_get requires owner (no target function specified)")
-
-                    # Look up target function metadata (cache should already be built)
-                    app_path = self.function_manager._app_name_to_path(target_app_name) if target_app_name else None
-                    target_metadata = self.function_manager._function_metadata_by_app.get(app_path, {}).get(target_func_name)
-
-                    if not target_metadata:
-                        logger.warning(f"🚨 SECURITY: Non-owner '{caller}' tried _function_get for unknown function '{target_func_name}'")
-                        raise ValueError(f"Access denied: Function '{target_func_name}' not found")
-
-                    # Check for @copy decorator
-                    is_copyable = target_metadata.get('is_copyable', False)
-                    if not is_copyable:
-                        logger.warning(f"🚨 SECURITY: Non-owner '{caller}' tried to copy '{target_func_name}' without @copy decorator")
-                        raise ValueError(f"Access denied: Function '{target_func_name}' is not copyable (missing @copy decorator)")
-
-                    # Has @copy - now check visibility decorators
-                    decorators_list = target_metadata.get('decorators', [])
-
-                    if 'public' in decorators_list:
-                        # @copy + @public = anyone can read
-                        logger.debug(f"✅ _function_get authorized for '{target_func_name}' (@copy + @public) by caller: {caller}")
-                    elif 'protected' in decorators_list:
-                        # @copy + @protected = check protection function
-                        protection_name = target_metadata.get('protection_name')
-                        if not protection_name:
-                            logger.warning(f"🚨 SECURITY: Function '{target_func_name}' has @protected but no protection function")
-                            raise ValueError(f"Access denied: Function '{target_func_name}' has @protected but no protection function")
-
-                        logger.debug(f"🔒 _function_get for '{target_func_name}' (@copy + @protected) - calling protection function: {protection_name}")
-
-                        # Call protection function to check authorization
-                        try:
-                            is_allowed = await self.function_manager.function_call(
-                                name=protection_name,
-                                client_id=client_id,
-                                request_id=request_id,
-                                user=user,
-                                app=None,  # Protection functions must be top-level
-                                args={'user': user}
-                            )
-
-                            if not is_allowed:
-                                logger.warning(f"🚨 SECURITY: Protection function '{protection_name}' denied _function_get for '{target_func_name}' by user '{user}'")
-                                raise PermissionError(f"Access denied: User '{user}' not authorized to copy '{target_func_name}'")
-
-                            logger.debug(f"✅ _function_get authorized for '{target_func_name}' via protection function '{protection_name}'")
-                        except PermissionError:
-                            raise
-                        except Exception as prot_err:
-                            logger.error(f"❌ Error executing protection function '{protection_name}' for _function_get: {prot_err}")
-                            raise PermissionError(f"Access denied: Error checking authorization for '{target_func_name}'") from prot_err
-                    else:
-                        # @copy + @visible (or other owner-only decorator) = still owner-only
-                        logger.warning(f"🚨 SECURITY: Non-owner '{caller}' tried to copy owner-only function '{target_func_name}' (has @copy but not @public/@protected)")
-                        raise ValueError(f"Access denied: Function '{target_func_name}' is owner-only (@copy requires @public or @protected for non-owner access)")
-
-            # Security check: Only owner can call other internal functions
-            elif (actual_function_name.startswith('_function') or
-                  actual_function_name.startswith('_server') or
-                  actual_function_name.startswith('_admin')):
-
-                caller = user or client_id or "unknown"
-
-                # Treat localhost websocket connections as the owner
-                is_localhost = caller.startswith("ws_127.0.0.1_")
-
-                if not is_localhost and not atlantis.is_owner(caller):
-                    logger.warning(f"🚨 SECURITY: Internal function '{actual_function_name}' called by '{caller}' but owner usernames are '{atlantis.get_owner_usernames()}' - ACCESS DENIED")
-                    raise ValueError(f"Access denied: Internal functions can only be accessed by owner")
-
-                logger.debug(f"✅ Internal function '{actual_function_name}' authorized for owner: {caller}")
-            else:
-                # Non-internal function: validate it has a required decorator and check access
-                # Get function metadata from cache to check decorators
-                await self.function_manager._build_function_file_mapping()
-                app_path = self.function_manager._app_name_to_path(parsed_app_name) if parsed_app_name else None
-                func_metadata = self.function_manager._function_metadata_by_app.get(app_path, {}).get(actual_function_name)
-
-                if func_metadata:
-                    decorators_list = func_metadata.get('decorators', [])
-                    has_required_decorator = any(dec in decorators_list for dec in VISIBILITY_DECORATORS)
-
-                    if not has_required_decorator:
-                        error_msg = f"Access denied: Function '{actual_function_name}' cannot be called remotely without a visibility decorator"
-                        logger.warning(f"🚨 SECURITY: {error_msg}")
-                        raise PermissionError(error_msg)
-
-                    # Check access based on decorator type
-                    is_public = 'public' in decorators_list
-                    is_index = 'index' in decorators_list
-                    is_protected = 'protected' in decorators_list
-
-                    if is_public or is_index:
-                        # @public or @index - anyone can call
-                        decorator_type = '@index' if is_index else '@public'
-                        logger.debug(f"✅ Public function '{actual_function_name}' ({decorator_type}) accessible to caller: {user or client_id or 'unknown'}")
-                    elif is_protected:
-                        # @protected - delegated access control via protection function (checked later in function_call)
-                        logger.debug(f"🔒 Protected function '{actual_function_name}' - access will be validated by protection function")
-                    else:
-                        # @visible, @tick, @chat, @text, @session, @game, @price, @location, or @app - owner-only access
-                        caller = user or client_id or "unknown"
-
-                        # Treat localhost websocket connections as the owner
-                        is_localhost = caller.startswith("ws_127.0.0.1_")
-
-                        if not is_localhost and not atlantis.is_owner(caller):
-                            logger.warning(f"🚨 SECURITY: Owner-only function '{actual_function_name}' called by '{caller}' but owner usernames are '{atlantis.get_owner_usernames()}' - ACCESS DENIED")
-                            raise PermissionError(f"Access denied: Function '{actual_function_name}' can only be accessed by owner")
-
-                        logger.debug(f"✅ Function '{actual_function_name}' authorized for owner: {caller}")
-
-                    logger.debug(f"✅ Function '{actual_function_name}' has valid decorator(s): {decorators_list}")
-                else:
-                    # Function not found in metadata - this shouldn't happen for valid functions
-                    logger.warning(f"⚠️ Function '{actual_function_name}' not found in metadata cache")
-
-            # Handle built-in tool calls
-            if actual_function_name == "_function_set":
-                logger.debug(f"---> Calling built-in: function_set") # <-- ADD THIS LINE
-                # function_set now returns (extracted_name, result_messages)
-                extracted_name, result_messages = await self.function_manager.function_set(args, self)
-                result_raw = result_messages # Use the messages returned by function_set
-                if extracted_name:
-                    # Notify only if function_set successfully extracted a name
-                    await self._notify_tool_list_changed(change_type="updated", tool_name=extracted_name)
-            elif actual_function_name == "_function_get":
-                logger.debug(f"---> Calling built-in: get_function_code") # <-- ADD THIS LINE
-                result_raw = await self.function_manager.get_function_code(args, self)
-            elif actual_function_name == "_function_remove":
-                # Remove function
-                func_name = args.get("name")
-                app_name = args.get("app")  # Optional app name for disambiguation
-                if not func_name:
-                    raise ValueError("Missing required parameter: name")
-
-                logger.debug(f"---> Calling built-in: function_remove for '{func_name}'" + (f" (app: {app_name})" if app_name else ""))
-
-                # Check if function exists using the function mapping (supports subfolders and app-specific lookup)
-                function_file = await self.function_manager._find_file_containing_function(func_name, app_name)
-
-                if not function_file:
-                    if app_name:
-                        error_message = f"Function '{func_name}' does not exist in app '{app_name}'."
-                    else:
-                        error_message = f"Function '{func_name}' does not exist."
-                    result_raw = error_message
-                else:
-                    # Function exists, continue with removing it
-                    await self.function_manager.function_remove(func_name, app_name)
-                    try:
-                        await self._notify_tool_list_changed(change_type="removed", tool_name=func_name) # Pass params
-                    except Exception as e:
-                        logger.error(f"Error sending tool notification after removing {func_name}: {str(e)}")
-                    result_raw = f"Function '{func_name}' removed successfully."
-
-            elif actual_function_name == "_function_add":
-                # Add empty function
-                logger.debug(f"---> Calling built-in: function_add with args:\n{format_json_log(args)}")
-
-                func_name = args.get("name")
-                app_name = args.get("app")  # Optional app name for disambiguation
-                location_value = args.get("location")  # Optional location decorator value
-                if not func_name:
-                    raise ValueError("Missing required parameter: name")
-
-                # Check if function already exists using the function mapping (supports subfolders and app-specific lookup)
-                function_file = await self.function_manager._find_file_containing_function(func_name, app_name)
-
-                if function_file:
-                    # Function already exists - find all locations containing this function
-                    existing_locations = []
-                    if not app_name:
-                        # Find ALL apps that contain this function, with filenames
-                        for existing_app_path, app_functions in self.function_manager._function_file_mapping_by_app.items():
-                            if func_name in app_functions:
-                                filename = app_functions[func_name]
-                                if existing_app_path is None:
-                                    location = f"root {filename}"
-                                else:
-                                    # Convert slash path to dot notation for display to user
-                                    existing_app_display = self.function_manager._path_to_app_name(existing_app_path)
-                                    location = f"{existing_app_display} {filename}"
-                                existing_locations.append(location)
-
-                    # Create detailed error message
-                    if app_name:
-                        error_message = f"Function '{func_name}' already exists in app '{app_name}'."
-                    elif existing_locations:
-                        if len(existing_locations) == 1:
-                            error_message = f"Function '{func_name}' already exists in {existing_locations[0]}."
-                        else:
-                            locations_list = ", ".join(existing_locations)
-                            error_message = f"Function '{func_name}' already exists in: {locations_list}. Specify an app parameter."
-                    else:
-                        error_message = f"Function '{func_name}' already exists."
-                    result_raw = error_message
-                else:
-                    # Function doesn't exist, create it
-                    await self.function_manager.function_add(func_name, None, app_name, location_value)
-                    try:
-                        await self._notify_tool_list_changed(change_type="added", tool_name=func_name) # Pass params
-                    except Exception as e:
-                        logger.error(f"Error sending tool notification after adding {func_name}: {str(e)}")
-                    # Show app in success message
-                    if app_name:
-                        result_raw = f"Empty function '{func_name}' created successfully in app '{app_name}'."
-                    else:
-                        result_raw = f"Empty function '{func_name}' created successfully in root."
-
-            elif actual_function_name == "_function_move":
-                # Move function from one app to another
-                logger.debug(f"---> Calling built-in: function_move with args:\n{format_json_log(args)}")
-
-                source_name = args.get("source_name")
-                source_app = args.get("source_app")
-                dest_app = args.get("dest_app")
-                dest_name = args.get("dest_name")
-                dest_location = args.get("dest_location")
-
-                if not source_name:
-                    raise ValueError("Missing required parameter: source_name")
-                if not dest_app:
-                    raise ValueError("Missing required parameter: dest_app")
-
-                try:
-                    result_msg = await self.function_manager.function_move(
-                        source_name, source_app, dest_app, dest_name, dest_location
-                    )
-                    # Notify for both old and new name if renamed
-                    final_name = dest_name or source_name
-                    await self._notify_tool_list_changed(change_type="updated", tool_name=final_name)
-                    result_raw = result_msg
-                except (ValueError, IOError) as e:
-                    result_raw = str(e)
-
-            elif actual_function_name == "_server_get":
-                svc_name = args.get("name")
-                if not svc_name:
-                    raise ValueError("Missing required parameter: name")
-                logger.debug(f"---> Calling built-in: server_get for '{svc_name}'")
-                result_raw = await self.server_manager.server_get(svc_name)
-            elif actual_function_name == "_server_add":
-                svc_name = args.get("name")
-                if not svc_name:
-                    raise ValueError("Missing required parameter: 'name' must be a string")
-                logger.debug(f"---> Calling built-in: server_add for '{svc_name}'")
-                # Now server_add only requires the name parameter and creates a template
-                success = await self.server_manager.server_add(svc_name)
-                if success:
-                    try:
-                        await self._notify_tool_list_changed(change_type="added", tool_name=svc_name)
-                    except Exception as e:
-                        logger.error(f"Error sending tool notification after adding server {svc_name}: {str(e)}")
-                    result_raw = f"MCP '{svc_name}' added successfully."
-                else:
-                    result_raw = f"Failed to add MCP '{svc_name}'."
-            elif actual_function_name == "_server_remove":
-                svc_name = args.get("name")
-                if not svc_name:
-                    raise ValueError("Missing required parameter: name")
-                logger.debug(f"---> Calling built-in: server_remove for '{svc_name}'")
-                success = await self.server_manager.server_remove(svc_name)
-                if success:
-                    try:
-                        await self._notify_tool_list_changed(change_type="removed", tool_name=svc_name)
-                    except Exception as e:
-                        logger.error(f"Error sending tool notification after removing server {svc_name}: {str(e)}")
-                    result_raw = f"Server '{svc_name}' removed successfully."
-                else:
-                    result_raw = f"Failed to remove server '{svc_name}'."
-            elif actual_function_name == "_server_set":
-                logger.debug(f"---> Calling built-in: server_set with args:\n{format_json_log(args)}")
-                # Extract the config from the args dictionary
-                config = args.get("config")
-                if not config:
-                    raise ValueError("Missing required parameter: config")
-
-                # Try to extract the server name from the config JSON, but allow non-JSON content
-                try:
-                    server_name = self.server_manager.extract_server_name(config)
-                    if not server_name:
-                        raise ValueError("Failed to get server name")
-                except Exception as e:
-                    # If parsing fails completely, we need an explicit name
-                    logger.warning(f"Could not parse config as JSON: {e}")
-                    # Check if name was provided directly
-                    server_name = args.get('name')
-                    if not server_name:
-                        raise ValueError("Unable to resolve server name")
-
-                # Call server_set with the correct parameters
-                result_raw = await self.server_manager.server_set(server_name, config)
-                # Notify clients that server configuration changed (could affect available tools)
-                if result_raw:  # Only notify on success
-                    try:
-                        await self._notify_tool_list_changed(change_type="updated", tool_name=server_name)
-                    except Exception as e:
-                        logger.error(f"Error sending tool notification after updating server {server_name}: {str(e)}")
-            elif actual_function_name == "_server_validate":
-                svc_name = args.get("name")
-                if not svc_name:
-                    raise ValueError("Missing required parameter: name")
-                logger.debug(f"---> Calling built-in: server_validate for '{svc_name}'")
-                result_raw = await self.server_manager.server_validate(svc_name)
-            elif actual_function_name == "_server_start":
-                logger.debug(f"---> Calling built-in: server_start with args:\n{format_json_log(args)}")
-                result_raw = await self.server_manager.server_start(args, self)
-                # Wait for server to be ready before notifying clients
-                server_name = args.get('name')
-                if server_name:
-                    try:
-                        # Wait for the server to finish initializing (with timeout)
-                        task_info = self.server_manager.server_tasks.get(server_name)
-                        if task_info and 'ready_event' in task_info:
-                            logger.debug(f"Waiting for server '{server_name}' to be ready before sending notification...")
-                            await asyncio.wait_for(task_info['ready_event'].wait(), timeout=30.0)
-                            logger.info(f"Server '{server_name}' is ready, invalidating cache and regenerating tool list")
-                            # Invalidate cache to force regeneration with new server tools
-                            self._cached_tools = None
-                            # Regenerate tool list (this will log all tools including new ones from the server)
-                            updated_tools = await self._get_tools_list(caller_context=f"after_server_start:{server_name}")
-                            # Report the updated tool list to console
-                            logger.info(f"📊 Reporting updated tool list after MCP server '{server_name}' started...")
-                            await self.cloud_client._report_tools_to_console(tools_list=updated_tools)
-                            # Now send notification to clients
-                            logger.info(f"Sending tool list change notification for '{server_name}'")
-                            await self._notify_tool_list_changed(change_type="updated", tool_name=server_name)
-                        else:
-                            logger.warning(f"No ready_event found for server '{server_name}', skipping notification wait")
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Timeout waiting for server '{server_name}' to be ready, sending notification anyway")
-                        await self._notify_tool_list_changed(change_type="updated", tool_name=server_name)
-                    except Exception as e:
-                        logger.error(f"Error sending tool notification after starting server {server_name}: {str(e)}")
-            elif actual_function_name == "_server_stop":
-                logger.debug(f"---> Calling built-in: server_stop with args:\n{format_json_log(args)}")
-                result_raw = await self.server_manager.server_stop(args, self)
-                # Notify clients that tool list has changed (server stopped = tools removed)
-                server_name = args.get('name')
-                if server_name:
-                    try:
-                        logger.info(f"Server '{server_name}' stopped, invalidating cache and regenerating tool list")
-                        # Invalidate cache to force regeneration without stopped server tools
-                        self._cached_tools = None
-                        # Regenerate tool list (this will log tools without the stopped server)
-                        updated_tools = await self._get_tools_list(caller_context=f"after_server_stop:{server_name}")
-                        # Report the updated tool list to console
-                        logger.info(f"📊 Reporting updated tool list after MCP server '{server_name}' stopped...")
-                        await self.cloud_client._report_tools_to_console(tools_list=updated_tools)
-                        # Now send notification to clients
-                        logger.info(f"Sending tool list change notification for '{server_name}'")
-                        await self._notify_tool_list_changed(change_type="updated", tool_name=server_name)
-                    except Exception as e:
-                        logger.error(f"Error sending tool notification after stopping server {server_name}: {str(e)}")
-            elif actual_function_name == "_server_get_tools":
-                server_name = args.get('name')
-                if not server_name or not isinstance(server_name, str):
-                     raise ValueError("Missing or invalid 'name' argument for _server_get_tools")
-                # Check if server was running before the call (to detect auto-start)
-                was_running = await self.server_manager.is_server_running(server_name)
-                result_raw = await self.server_manager.get_server_tools(server_name) # Pass only the name string (may auto-start)
-                # If server was auto-started, send notification
-                if not was_running:
-                    is_running_now = await self.server_manager.is_server_running(server_name)
-                    if is_running_now:
-                        logger.info(f"Server '{server_name}' was auto-started by get_server_tools")
-                        try:
-                            logger.info(f"Invalidating cache and regenerating tool list after auto-start")
-                            # Invalidate cache to force regeneration with new server tools
-                            self._cached_tools = None
-                            # Regenerate tool list (this will log all tools including new ones from the server)
-                            updated_tools = await self._get_tools_list(caller_context=f"after_autostart:{server_name}")
-                            # Report the updated tool list to console
-                            logger.info(f"📊 Reporting updated tool list after MCP server '{server_name}' auto-started...")
-                            await self.cloud_client._report_tools_to_console(tools_list=updated_tools)
-                            # Now send notification to clients
-                            logger.info(f"Sending tool list change notification for '{server_name}'")
-                            await self._notify_tool_list_changed(change_type="updated", tool_name=server_name)
-                        except Exception as e:
-                            logger.error(f"Error sending tool notification after auto-starting server {server_name}: {str(e)}")
-                # Convert Tool objects to dictionaries for JSON serialization
-                if result_raw and isinstance(result_raw, list):
-                    result_raw = [
-                        {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "inputSchema": tool.inputSchema
-                        }
-                        for tool in result_raw
-                    ]
-            elif actual_function_name == "_function_history":
-                app_name = args.get("app")  # Required app name
-                function_name = args.get("name")  # Required function name
-                logger.debug(f"---> Calling built-in: _function_history (app: {app_name}, function: {function_name})")
-
-                # First, validate that the function exists
-                try:
-                    function_file = await self.function_manager._find_file_containing_function(function_name, app_name)
-                    if not function_file:
-                        raise ValueError(f"Function '{function_name}' not found in app '{app_name or '(root)'}'")
-                except Exception as e:
-                    raise ValueError(f"Function '{function_name}' not found in app '{app_name or '(root)'}': {e}")
-
-                # Now get the history for this function
-                if not os.path.exists(TOOL_CALL_LOG_PATH):
-                    # No log file yet means no history (but function exists)
-                    result_raw = []
-                else:
-                    try:
-                        with open(TOOL_CALL_LOG_PATH, "r", encoding="utf-8") as f:
-                            # Read each line and parse as JSON, skipping empty lines
-                            log_entries = [json.loads(line) for line in f if line.strip()]
-
-                        # Filter by BOTH app_name and function name
-                        # NOTE: History is tracked separately per app. If you move a function
-                        # from one app to another (e.g., from root "" to "myapp" or vice versa),
-                        # a new separate history will be created for that app. Previous history
-                        # from the old app location will remain but won't be shown in the new location.
-                        filtered_entries = [
-                            entry for entry in log_entries
-                            if (entry.get("tool_name") == function_name and
-                                entry.get("app_name") == (app_name if app_name else ""))
-                        ]
-
-                        result_raw = filtered_entries
-                    except (json.JSONDecodeError, IOError) as e:
-                        logger.error(f"Error reading or parsing tool_call_log.json: {e}")
-                        raise ValueError(f"Error accessing function history: {e}")
-
-            elif actual_function_name == "_function_log":
-                app_name = args.get("app")  # Optional app name for filtering
-                logger.debug("---> Calling built-in: _function_log" + (f" (app: {app_name})" if app_name else ""))
-                if not os.path.exists(OWNER_LOG_PATH):
-                    # Return an empty history array
-                    result_raw = []
-                else:
-                    try:
-                        with open(OWNER_LOG_PATH, "r", encoding="utf-8") as f:
-                            file_content = f.read()
-                            # Handle empty file or file with only whitespace
-                            if not file_content.strip():
-                                log_entries = [] # Return empty list if file is effectively empty
-                            else:
-                                log_entries = json.loads(file_content) # Parse the string content
-
-                        # If app filter is provided, we could potentially filter here
-                        # For now, return all entries as the current log format may not track app info
-                        # TODO: Implement app-based filtering when log format includes app information
-                        # Return the list of log entries directly
-                        result_raw = log_entries
-                    except (json.JSONDecodeError, IOError) as e:
-                        logger.error(f"Error reading or parsing owner log: {e}")
-                        # Return an error message inside the tool response
-                        raise ValueError(f"Error accessing function history: {e}")
-
-            elif actual_function_name == "_admin_restart":
-                # Restart the server by terminating the process (wrapper script should restart it)
-                logger.info(f"🔄 ADMIN RESTART requested by owner: {user or 'unknown'}")
-
-                # Send response first before terminating
-                result_raw = "Server restart initiated. The process will terminate and should be restarted by wrapper script."
-
-                # Schedule termination after a brief delay to allow response to be sent
-                async def delayed_shutdown():
-                    await asyncio.sleep(0.1)  # Brief delay to send response
-                    logger.info("🛑 Sending SIGINT for graceful restart...")
-                    os.kill(os.getpid(), signal.SIGINT)  # Same as Ctrl-C - triggers graceful shutdown
-
-                # Schedule the shutdown task
-                asyncio.create_task(delayed_shutdown())
-
-            elif actual_function_name == "_admin_pip_install":
-                # Install Python packages using pip
-                package = args.get("package")
-                force = False  # Hardcoded to false for now
-
-                if not package:
-                    raise ValueError("Missing required parameter: package")
-
-                logger.info(f"📦 ADMIN PIP INSTALL requested by owner: {user or 'unknown'} - Package: {package}")
-
-                # Build pip command
-                pip_cmd = [sys.executable, "-m", "pip", "install", package]
-                if force:
-                    pip_cmd.append("--force-reinstall")
-
-                try:
-                    # Run pip install command
-                    result = subprocess.run(
-                        pip_cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=300  # 5 minute timeout
+            if result_raw is BUILTIN_NOT_HANDLED:
+                if '.' in actual_function_name or ' ' in actual_function_name:
+                    return await self._execute_proxy_tool(
+                        name=name,
+                        actual_function_name=actual_function_name,
+                        args=args,
                     )
 
-                    if result.returncode == 0:
-                        success_msg = f"✅ Successfully installed package: {package}"
-                        if result.stdout:
-                            success_msg += f"\n\nOutput:\n{result.stdout}"
-                        logger.info(f"📦 Package '{package}' installed successfully")
-                        result_raw = success_msg
-                    else:
-                        error_msg = f"❌ Failed to install package: {package}"
-                        if result.stderr:
-                            error_msg += f"\n\nError output:\n{result.stderr}"
-                        if result.stdout:
-                            error_msg += f"\n\nStdout:\n{result.stdout}"
-                        logger.error(f"📦 Failed to install package '{package}': {result.stderr}")
-                        result_raw = error_msg
-
-                except subprocess.TimeoutExpired:
-                    timeout_msg = f"⏰ Pip install timed out after 5 minutes for package: {package}"
-                    logger.error(f"📦 Pip install timeout for package '{package}'")
-                    result_raw = timeout_msg
-                except Exception as e:
-                    error_msg = f"💥 Error during pip install for package '{package}': {str(e)}"
-                    logger.error(f"📦 Pip install error for package '{package}': {str(e)}")
-                    result_raw = error_msg
-
-            elif actual_function_name == "_public_click":
-                # Handle click events by invoking stored callbacks as dynamic functions
-                key = args.get("key")
-                if not key:
-                    raise ValueError("Missing required parameter: key")
-
-                logger.info(f"🖱️ PUBLIC CLICK: {user} clicked key: {key}")
-
-                # Check if we have a callback for this key using the global atlantis
-                callback = atlantis._click_callbacks.get(key)
-                logger.info(f"🖱️ Available callback keys: {list(atlantis._click_callbacks.keys())}")
-
-                if callback:
-                    logger.info(f"🖱️ Found callback for key '{key}', invoking as dynamic function...")
-
-                    # Create a wrapper function that can be called as a dynamic function
-                    # We'll inject it temporarily into atlantis and call it through function_manager
-                    wrapper_name = f"_click_callback_{key.replace('-', '_').replace('.', '_')}"
-
-                    # Inject the callback into the existing atlantis context temporarily
-                    setattr(atlantis, wrapper_name, callback)
-
-                    try:
-                        # Invoke through function manager to get full dynamic function context
-                        result_raw = await self.function_manager.function_call(
-                            name=wrapper_name,
-                            client_id=client_id,
-                            request_id=request_id,
-                            user=user,
-                            session_id=session_id,
-                            app=None,  # No specific app
-                            args={}    # No additional args
-                        )
-                    finally:
-                        # Clean up the temporary wrapper
-                        if hasattr(atlantis, wrapper_name):
-                            delattr(atlantis, wrapper_name)
-                else:
-                    logger.info(f"🖱️ No callback found for key '{key}'")
-                    result_raw = f"🖱️ Click received for key '{key}' but no callback registered"
-
-            elif actual_function_name == "_public_upload":
-                # Handle uploads by invoking stored callbacks as dynamic functions
-                # DEPRECATED
-                key = args.get("key")
-                filename = args.get("filename")
-                filetype = args.get("filetype")
-                base64Content = args.get("base64Content")
-
-                if not key:
-                    raise ValueError("Missing required parameter: key")
-                if not filename:
-                    raise ValueError("Missing required parameter: filename")
-                if not filetype:
-                    raise ValueError("Missing required parameter: filetype")
-                if not base64Content:
-                    raise ValueError("Missing required parameter: base64Content")
-
-                logger.info(f"🖱️ PUBLIC UPLOAD: {user} uploading id: {key}, filename: {filename}, filetype: {filetype}")
-
-                # Check if we have a callback for this key using the global atlantis
-                callback = atlantis._upload_callbacks.get(key)
-                logger.info(f"🖱️ Available callback keys: {list(atlantis._upload_callbacks.keys())}")
-
-                if callback:
-                    logger.info(f"🖱️ Found callback for key '{key}', invoking as dynamic function...")
-
-                    # Create a wrapper function that can be called as a dynamic function
-                    # We'll inject it temporarily into atlantis and call it through function_manager
-                    wrapper_name = f"_upload_callback_{key.replace('-', '_').replace('.', '_')}"
-
-                    # Inject the callback into the existing atlantis context temporarily
-                    setattr(atlantis, wrapper_name, callback)
-
-                    try:
-                        # Invoke through function manager to get full dynamic function context
-                        result_raw = await self.function_manager.function_call(
-                            name=wrapper_name,
-                            client_id=client_id,
-                            request_id=request_id,
-                            user=user,
-                            session_id=session_id,
-                            app=None,  # No specific app
-                            args={"filename": filename, "filetype": filetype, "base64Content": base64Content}
-                        )
-                    finally:
-                        # Clean up the temporary wrapper
-                        if hasattr(atlantis, wrapper_name):
-                            delattr(atlantis, wrapper_name)
-                else:
-                    logger.info(f"🖱️ No callback found for key '{key}'")
-                    result_raw = f"🖱️ Upload received for key '{key}' but no callback registered"
-
-            elif actual_function_name == "_admin_app_create":
-                # Create a new app directory with main.py containing empty index() function
-                app_name = args.get("appName")
-                if not app_name:
-                    raise ValueError("Missing required parameter: appName")
-
-                logger.info(f"📁 ADMIN APP CREATE requested by owner: {user or 'unknown'} - App: {app_name}")
-
-                # Check if app directory already exists
-                app_path = self.function_manager._app_name_to_path(app_name)
-                target_dir = os.path.join(self.function_manager.functions_dir, app_path)
-                main_py_path = os.path.join(target_dir, "main.py")
-
-                if os.path.exists(main_py_path):
-                    error_msg = f"App '{app_name}' already exists at {app_path}/main.py"
-                    logger.warning(f"❌ App create failed: {error_msg}")
-                    raise ValueError(error_msg)
-
-                # Create app directory with main.py containing empty index() function
-                # Generate custom stub with @index decorator
-                function_name = "index"
-                index_stub = """\
-import atlantis
-import logging
-
-logger = logging.getLogger("mcp_server")
-
-
-@visible
-@index
-async def index():
-    \"\"\"
-    This is the entry point for the app
-    \"\"\"
-    logger.info("Executing app index function...")
-
-    await atlantis.client_log("index running")
-
-    # Replace this return statement with your function's result
-    return "App index executed successfully."
-
-"""
-                await self.function_manager.function_add(function_name, index_stub, app_name)
-                try:
-                    await self._notify_tool_list_changed(change_type="added", tool_name=function_name)
-                except Exception as e:
-                    logger.error(f"Error sending tool notification after adding {function_name}: {str(e)}")
-                result_raw = f"✅ Successfully created app '{app_name}' with main.py containing {function_name}() function"
-
-            elif actual_function_name == "_admin_git_update":
-                # Update server code by running git fetch and git merge
-                remote = args.get("remote", "origin")
-                branch = args.get("branch", "main")
-
-                logger.info(f"🔄 ADMIN GIT UPDATE requested by owner: {user or 'unknown'} - Remote: {remote}, Branch: {branch}")
-
-                try:
-                    # Run git fetch
-                    fetch_result = subprocess.run(
-                        ["git", "fetch", remote],
-                        capture_output=True,
-                        text=True,
-                        cwd=os.path.dirname(os.path.abspath(__file__))
+                if not (
+                    actual_function_name.startswith('_function')
+                    or actual_function_name.startswith('_server')
+                    or actual_function_name.startswith('_admin')
+                    or actual_function_name.startswith('_public')
+                ):
+                    result_raw = await self._execute_dynamic_tool(
+                        name=name,
+                        actual_function_name=actual_function_name,
+                        args=args,
+                        parsed_app_name=parsed_app_name,
+                        decorators_list=decorators_list,
+                        client_id=client_id,
+                        request_id=request_id,
+                        user=user,
+                        session_id=session_id,
+                        command_seq=command_seq,
+                        shell_path=shell_path,
                     )
-
-                    if fetch_result.returncode != 0:
-                        error_msg = f"❌ Git fetch failed: {fetch_result.stderr.strip()}"
-                        logger.error(f"🔄 Git fetch error: {error_msg}")
-                        result_raw = error_msg
-                    else:
-                        # Run git merge
-                        merge_result = subprocess.run(
-                            ["git", "merge", f"{remote}/{branch}"],
-                            capture_output=True,
-                            text=True,
-                            cwd=os.path.dirname(os.path.abspath(__file__))
-                        )
-
-                        if merge_result.returncode != 0:
-                            error_msg = f"❌ Git merge failed: {merge_result.stderr.strip()}"
-                            logger.error(f"🔄 Git merge error: {error_msg}")
-                            result_raw = error_msg
-                        else:
-                            success_msg = f"✅ Successfully updated from {remote}/{branch}"
-                            if merge_result.stdout.strip():
-                                success_msg += f"\n{merge_result.stdout.strip()}"
-                            logger.info(f"🔄 Git update successful: {success_msg}")
-                            result_raw = success_msg
-
-                except Exception as e:
-                    error_msg = f"❌ Git update failed with exception: {str(e)}"
-                    logger.error(f"🔄 Git update exception: {error_msg}")
-                    result_raw = error_msg
-
-            elif actual_function_name.startswith('_function') or actual_function_name.startswith('_server') or actual_function_name.startswith('_admin') or actual_function_name.startswith('_public'):
-                # Catch-all for invalid internal functions (only _function*, _server*, _admin*, and _public* are internal)
-                result_raw = f"Invalid internal function: '{actual_function_name}'. Check available internal functions."
-
-            # Handle MCP tool calls (check actual_function_name after asterisk parsing to avoid false positives from dots in app names)
-            elif '.' in actual_function_name or ' ' in actual_function_name:
-
-                # --- Handle MCP tool call ---
-
-                logger.info(f"🌐 MCP TOOL CALL: {actual_function_name}")
-                # Split on the first occurrence of '.' or ' '
-                server_alias, tool_name_on_server = re.split('[. ]', actual_function_name, 1)
-                logger.debug(f"Parsed: Server Alias='{server_alias}', Remote Tool='{tool_name_on_server}'")
-
-                # Check if MCP server config exists and is running
-                if server_alias not in self._server_configs: # Access instance variable
-                       raise ValueError(f"Unknown server alias: '{server_alias}'")
-                if not await self.server_manager.is_server_running(server_alias):
-                    raise ValueError(f"Server '{server_alias}' is not running.")
-
-                # Get the session for the target server
-                task_info = self.server_manager.server_tasks.get(server_alias)
-                if not task_info:
-                     # This shouldn't happen if the check above passed, but safety first
-                    raise ValueError(f"Could not find task info for running server '{server_alias}'.")
-
-                session = task_info.get('session')
-                ready_event = task_info.get('ready_event')
-
-                if not session and ready_event:
-                    session_ready_timeout = 5.0 # Allow a bit more time for proxy calls
-                    logger.debug(f"Session for '{server_alias}' not immediately ready for proxy call. Waiting up to {session_ready_timeout}s...")
-                    try:
-                        await asyncio.wait_for(ready_event.wait(), timeout=session_ready_timeout)
-                        session = task_info.get('session') # Re-fetch session after wait
-                        if not session:
-                            raise ValueError(f"Server '{server_alias}' session not available even after waiting.")
-                        logger.debug(f"Session for '{server_alias}' became ready.")
-                    except asyncio.TimeoutError:
-                         raise ValueError(f"Timeout waiting for server '{server_alias}' session to become ready for proxy call.")
-                elif not session:
-                     # Session not available and no ready_event to wait for
-                     raise ValueError(f"Server '{server_alias}' is running but its session is not available and cannot wait (no ready_event).")
-
-                # Proxy the call using the retrieved session
-                try:
-                    logger.info(f"🌐 PROXYING tool call '{tool_name_on_server}' to server '{server_alias}' with args: {args}")
-                    # Use the standard request timeout defined elsewhere
-                    proxy_response: CallToolResult = await asyncio.wait_for(
-                        session.call_tool(tool_name_on_server, args or {}),
-                        timeout=SERVER_REQUEST_TIMEOUT
-                    )
-                    logger.info(f"✅ PROXY response received from '{server_alias}'")
-                    logger.debug(f"Raw Proxy Response: {proxy_response}") # proxy_response is CallToolResult
-
-                    # Extract value from proxied result - prefer structuredContent if available
-                    proxy_value = None
-                    if hasattr(proxy_response, 'structuredContent') and proxy_response.structuredContent is not None:
-                        proxy_value = proxy_response.structuredContent
-                        logger.debug(f"Using structuredContent from proxied response")
-                    elif proxy_response.content and isinstance(proxy_response.content, list):
-                        # Fall back to extracting text from content
-                        if len(proxy_response.content) == 1 and hasattr(proxy_response.content[0], 'text'):
-                            # Try to parse as JSON
-                            try:
-                                proxy_value = json.loads(proxy_response.content[0].text)
-                            except (json.JSONDecodeError, TypeError):
-                                proxy_value = proxy_response.content[0].text
-                        else:
-                            # Multiple content items - return as list of texts
-                            proxy_value = [getattr(c, 'text', str(c)) for c in proxy_response.content]
-                        logger.debug(f"Extracted value from proxied content: {type(proxy_value)}")
-                    else:
-                        error_message = f"Proxied server '{server_alias}' returned unexpected content format: {proxy_response.content}"
-                        logger.error(error_message)
-                        raise ValueError(error_message)
-
-                    is_error = getattr(proxy_response, 'isError', False)
-                    logger.debug(f"<--- _execute_tool RETURNING proxied result as ToolResult.")
-                    return ToolResult(value=proxy_value, is_error=is_error)
-
-                except McpError as mcp_err:
-                    logger.error(f"❌ MCPError proxying tool call '{name}' to '{server_alias}': {mcp_err}", exc_info=True)
-                    # Format the MCPError into a user-friendly error message
-                    error_message = f"Error calling '{tool_name_on_server}' on server '{server_alias}': {mcp_err.message} (Code: {mcp_err.code})"
-                    raise ValueError(error_message) from mcp_err
-                except asyncio.TimeoutError:
-                    logger.error(f"❌ Timeout proxying tool call '{name}' to '{server_alias}'.")
-                    raise ValueError(f"Timeout calling '{tool_name_on_server}' on server '{server_alias}'.")
-                except Exception as proxy_err:
-                    logger.error(f"❌ Unexpected error proxying tool call '{name}' to '{server_alias}': {proxy_err}", exc_info=True)
-                    raise ValueError(f"Unexpected error calling '{tool_name_on_server}' on server '{server_alias}': {proxy_err}") from proxy_err
-
-            elif not (actual_function_name.startswith('_function') or actual_function_name.startswith('_server') or actual_function_name.startswith('_admin') or actual_function_name.startswith('_public')):
-
-                # --- Handle Local Dynamic Function Call ---
-                logger.info(f"🔧 CALLING LOCAL DYNAMIC FUNCTION: {name}")
-
-                # warn if cached load error
-                if name in _runtime_errors:
-                     load_error_info = _runtime_errors[name]
-                     logger.warning(f"❌ Function '{name}' has a cached load error: {load_error_info['error']}")
-                     # Maybe return a specific error message here instead of raising ValueError?
-                     # Creating an error TextContent for consistency
-
-                # NEW: Function calling now uses function-to-file mapping internally
-                # No need to check if {name}.py exists since function_call handles that
-
-                # Call the dynamic function
-                try:
-                    # Dynamic functions are directly handled by name matching
-                    # Add detailed logging to show exactly what we're receiving from the cloud
-                    logger.info(f"RECEIVED FROM CLOUD: Tool: '{name}', Type: {type(args)}, User: {user}")
-                    if isinstance(args, dict):
-                        logger.info(f"Args:\n{format_json_log(args, colored=True)}")
-                    else:
-                        logger.info(f"Args: {args!r}")
-                    logger.debug(f"---> Calling dynamic: function_call for '{actual_function_name}' with args: {args} and client_id: {client_id} and request_id: {request_id}, user: {user}") # Log args and client_id separately
-                    # Pass arguments, client_id, user, and session_id distinctly
-                    # Pass parsed app name for proper function routing
-                    final_args = args.copy() if args else {}
-                    result_raw = await self.function_manager.function_call(name=actual_function_name, client_id=client_id, request_id=request_id, user=user, session_id=session_id, command_seq=command_seq, shell_path=shell_path, app=parsed_app_name, args=final_args)
-                    logger.debug(f"<--- Dynamic function '{name}' RAW result: {result_raw} (type: {type(result_raw)})")
-
-                    # @text functions must return a string
-                    if hasattr(decorators_list, '__contains__') and 'text' in decorators_list:
-                        if result_raw is not None and not isinstance(result_raw, str):
-                            logger.error(f"🚨 @text function '{actual_function_name}' returned {type(result_raw).__name__} instead of str - coercing to string")
-                            result_raw = str(result_raw)
-                except Exception as e:
-                    # Error already enhanced with command context at source, just re-raise
-                    raise
-
-
-            else:
-                # Handle unknown tool names starting with '_', or if no branch matched
-                logger.error(f"❓ Unknown or unhandled tool name: {name}")
-                raise ValueError(f"Unknown or unhandled tool name: {name}")
-
+                else:
+                    logger.error(f"❓ Unknown or unhandled tool name: {name}")
+                    raise ValueError(f"Unknown or unhandled tool name: {name}")
             # Log result before returning
             CYAN = "\x1b[96m"
             RESET = "\x1b[0m"
@@ -3055,7 +2959,7 @@ async def index():
 
         # Extract required parameters
         tool_name = params.get("name")
-        tool_args = params.get("arguments") # MCP spec uses 'arguments'
+        tool_args = params.get("arguments", {}) # MCP spec uses 'arguments'
 
         # Extract optional context fields
         user = params.get("user", None)
@@ -3064,11 +2968,11 @@ async def index():
         shell_path = params.get("shell_path", None)
 
         # Validate required parameters
-        if tool_name is None or tool_args is None:
+        if tool_name is None:
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": -32602, "message": "Invalid params: missing tool name or arguments"}
+                "error": {"code": -32602, "message": "Invalid params: missing tool name"}
             }
 
         # Log the call
@@ -3095,16 +2999,17 @@ async def index():
             connection_info = client_connections[client_id]
             logger.debug(f"✅ Found client {client_id} with type: {connection_info.get('type')}")
 
-        # Intercept local (non-cloud) tool calls to handle pseudo tools
+        # Intercept local (non-cloud) tool calls to handle lobster tools
         # CLAUDE etc come thru here
         if not for_cloud:
             logger.info(f"🏠 Local MCP tool call intercepted: {tool_name}")
 
-            # Check if cloud connection exists (same logic as pseudo tool list generation)
+            # Check if cloud connection exists (same logic as lobster tool list generation)
             has_cloud_connection = any(info.get("type") == "cloud" for info in client_connections.values())
 
-            # If local client + cloud exists, this must be a pseudo tool (readme or command)
-            if has_cloud_connection and (tool_name == "readme" or tool_name == "command"):
+            # If local client + cloud exists, check if this is a lobster tool
+            lobster_tool_names = {t.name for t in self.lobster_tools} if self.lobster_tools else set()
+            if has_cloud_connection and tool_name in lobster_tool_names:
                 # Find first cloud connection (client_connections already declared global above)
                 cloud_client_id = None
 
@@ -3126,44 +3031,20 @@ async def index():
                         }
                     }
 
+
                 # Send awaitable command to cloud client
-                # For pseudo tools, use the generic request_id from cloud
+                # For lobster tools, use the lobster request_id from cloud
                 try:
-                    # Get the generic request_id from the cloud client
-                    generic_req_id = self.cloud_client.generic_request_id if hasattr(self, 'cloud_client') and self.cloud_client else None
-                    logger.info(f"☁️ Sending '{tool_name}' command to cloud client {cloud_client_id}")
-                    logger.info(f"🔄 Pseudo tool detected - using generic request_id ({generic_req_id}) instead of MCP request_id ({request_id})")
-                    response = await self.send_awaitable_client_command(
-                        client_id_for_routing=cloud_client_id,
-                        request_id=generic_req_id,  # Use generic request_id for pseudo tools
-                        command=tool_name,
-                        command_data=params.get("arguments", {}),
-                        seq_num=1,
-                        entry_point_name=tool_name,
-                        local_pseudo_call=True,  # Flag this as a pseudo tool call from local client
-                        user=atlantis._owner  # Use the owner username from the welcome message
+                    lobster_req_id = self.cloud_client.lobster_request_id if hasattr(self, 'cloud_client') and self.cloud_client else None
+                    return await handle_local_lobster_tool_call(
+                        self,
+                        tool_name=tool_name,
+                        params=params,
+                        request_id=request_id,
+                        cloud_client_id=cloud_client_id,
+                        lobster_request_id=lobster_req_id,
+                        user=atlantis._owner
                     )
-
-                    logger.info(f"☁️ Got response from cloud client")
-                    logger.info(f"☁️ Response structure: {format_json_log(response) if isinstance(response, (dict, list)) else repr(response)}")
-
-                    # Return the response wrapped in MCP format
-                    # Format JSON nicely so Claude can read it
-                    response_text = format_json_log(response, colored=False) if isinstance(response, (dict, list)) else str(response)
-                    result = {
-                        "content": [{"type": "text", "text": response_text}]
-                    }
-
-                    # Don't add structuredContent here - cloud already sends it properly formatted
-                    # and we unwrapped it. Just pass through as text.
-
-                    mcp_response = {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "result": result
-                    }
-                    logger.info(f"📤 Returning MCP response: {format_json_log(mcp_response)}")
-                    return mcp_response
                 except Exception as e:
                     logger.error(f"❌ Error sending {tool_name} to cloud: {e}")
                     return {
@@ -3435,42 +3316,6 @@ async def get_all_tools_for_response(server: 'DynamicAdditionServer', caller_con
     logger.debug(f"Helper: Prepared {len(tools_dict_list)} tool dictionaries.")
     return tools_dict_list
 
-def get_pseudo_tools_for_response(server: 'DynamicAdditionServer') -> List[Dict[str, Any]]:
-    """
-    Returns pseudo tools for local WebSocket connections as serialized dicts.
-    Tool definitions are pulled dynamically from the cloud welcome event.
-    """
-    # Use dynamically-loaded pseudo tools from cloud welcome event
-    if server.pseudo_tools:
-        logger.info(f"🏠 Returning {len(server.pseudo_tools)} pseudo tools from cloud welcome event")
-        return [t.model_dump(mode='json') for t in server.pseudo_tools]
-
-    # No pseudo tools received from cloud
-    logger.error(f"🚨 No pseudo tools available - cloud has not sent pseudoTools in welcome event")
-    return []
-
-    # # OLD: hardcoded fallback defaults (now pulled dynamically from welcome event)
-    # fallback_tools = [
-    #     Tool(
-    #         name="readme",
-    #         description="Returns information about this MCP server",
-    #         inputSchema={"type": "object", "properties": {}, "required": []},
-    #     ),
-    #     Tool(
-    #         name="command",
-    #         description="Execute a command (placeholder - does nothing for now)",
-    #         inputSchema={
-    #             "type": "object",
-    #             "properties": {
-    #                 "cmd": {"type": "string", "description": "The command to execute"}
-    #             },
-    #             "required": ["cmd"]
-    #         },
-    #     )
-    # ]
-    # return [t.model_dump(mode='json') for t in fallback_tools]
-
-
 async def get_filtered_tools_for_response(server: 'DynamicAdditionServer', caller_context: str) -> List[Dict[str, Any]]:
     """
     Fetches tools, filters out server-type tools, and prepares them for a JSON response.
@@ -3533,9 +3378,64 @@ class ServiceClient:
         self.connection_active = True
         # Store creation time for stable client ID
         self._creation_time = int(time.time())
-        # Store the generic request_id received from cloud for unsolicited requests
-        self.generic_request_id = None
+        # Store the lobster request_id received from cloud for unsolicited requests
+        self.lobster_request_id = None
+        # Throttle repeated identical connect_error logs while the cloud is down.
+        self._connect_error_signature = None
+        self._connect_error_last_logged_at = None
+        self._suppressed_connect_error_count = 0
+        self._connect_error_log_interval_seconds = 60
         logger.info(f"🎯 ServiceClient initialized with appName: '{self.appName}', serviceName: '{self.serviceName}'")
+
+    def _flush_suppressed_connect_errors(self, context: str):
+        """Emit one summary line for repeated connect_error events, if any were suppressed."""
+        if self._suppressed_connect_error_count <= 0 or not self._connect_error_signature:
+            return
+
+        logger.warning(
+            f"☁️ {context}: suppressed {self._suppressed_connect_error_count} repeated "
+            f"cloud connection errors ({self._connect_error_signature})"
+        )
+        self._suppressed_connect_error_count = 0
+
+    def _reset_connect_error_throttle(self):
+        """Reset connect_error throttling state after recovery."""
+        self._connect_error_signature = None
+        self._connect_error_last_logged_at = None
+        self._suppressed_connect_error_count = 0
+
+    def _log_connect_error(self, data):
+        """Log connect_error with throttling so an offline cloud does not spam the logs."""
+        error_text = str(data)
+        now = time.monotonic()
+        same_error = error_text == self._connect_error_signature
+        interval_elapsed = (
+            self._connect_error_last_logged_at is None
+            or (now - self._connect_error_last_logged_at) >= self._connect_error_log_interval_seconds
+        )
+
+        if not same_error:
+            self._flush_suppressed_connect_errors("Previous cloud failure pattern ended")
+            logger.error(f"❌ DETAILED CLOUD CONNECTION FAILURE INFO: {error_text}")
+            self._connect_error_signature = error_text
+            self._connect_error_last_logged_at = now
+            self._suppressed_connect_error_count = 0
+            return
+
+        if interval_elapsed:
+            if self._suppressed_connect_error_count > 0:
+                logger.warning(
+                    f"☁️ Cloud connection still failing; suppressed "
+                    f"{self._suppressed_connect_error_count} repeated errors "
+                    f"({error_text})"
+                )
+                self._suppressed_connect_error_count = 0
+            else:
+                logger.error(f"❌ DETAILED CLOUD CONNECTION FAILURE INFO: {error_text}")
+            self._connect_error_last_logged_at = now
+            return
+
+        self._suppressed_connect_error_count += 1
 
     # THIS IS THE BIG REPORT
     async def _report_tools_to_console(self, tools_list=None):
@@ -3828,6 +3728,7 @@ class ServiceClient:
                     "apiKey": self.api_key,
                     "serviceName": self.serviceName,
                     "appName": self.appName,
+                    "remoteType": "python",
                     "hostname": hostname,
                     "port": self.server_port, # Send the stored port
                     "serverVersion": SERVER_VERSION,
@@ -3928,57 +3829,10 @@ class ServiceClient:
         # Connection established event
         @self.sio.event(namespace=self.namespace)
         async def welcome(data): # Ensure handler is async
-            logger.info(f"☁️ Received welcome message:\n{format_json_log(data)}")
-            # Parse owner usernames from welcome data
-            if isinstance(data, dict):
-                # New format: JSON object with usernames and genericRequestId
-                owner_usernames = data.get('usernames', [])
-                generic_request_id = data.get('genericRequestId')
-                atlantis._set_owner_usernames(owner_usernames)
-                atlantis._set_owner(owner_usernames[0] if owner_usernames else self.email)
-                if generic_request_id:
-                    # genericRequestId = cloud-assigned ID used as requestId for pseudo tool calls
-                    # (pseudo tools originate locally so they don't have their own MCP requestId)
-                    logger.info(f"☁️ Generic request ID: {generic_request_id}")
-                    self.generic_request_id = generic_request_id
-                else:
-                    logger.error(f"🚨🚨🚨 FATAL: No genericRequestId in welcome message! Cannot operate without it! 🚨🚨🚨")
-                    logger.error(f"🚨 Welcome data received: {format_json_log(data)}")
-                    raise RuntimeError("Cloud welcome message missing required 'genericRequestId' - cannot continue")
+            apply_cloud_welcome(self, data)
 
-                # Pull pseudo tools from welcome payload (dynamically defined by cloud)
-                if 'pseudoTools' not in data:
-                    logger.error(f"🚨🚨🚨 CRITICAL: No pseudoTools field in welcome message! Local proxy tools will not be available! 🚨🚨🚨")
-                    logger.error(f"🚨 Welcome data received: {format_json_log(data)}")
-                else:
-                    pseudo_tools_data = data['pseudoTools']
-                    if not pseudo_tools_data:
-                        logger.error(f"🚨 pseudoTools array is empty in welcome message - no local proxy tools will be exposed")
-                    else:
-                        parsed_tools = []
-                        for t in pseudo_tools_data:
-                            try:
-                                parsed_tools.append(Tool(
-                                    name=t['name'],
-                                    description=t.get('description', ''),
-                                    inputSchema=t.get('inputSchema', {"type": "object", "properties": {}}),
-                                ))
-                            except Exception as e:
-                                logger.error(f"❌ Failed to parse pseudo tool '{t.get('name', '?')}': {e}")
-                        self.mcp_server.pseudo_tools = parsed_tools
-                        logger.info(f"🧰 Received {len(parsed_tools)} pseudo tools from cloud: {[t.name for t in parsed_tools]}")
-            elif isinstance(data, list):
-                # Legacy format: array of usernames
-                logger.warning(f"⚠️ Welcome message using LEGACY format (array of usernames) - missing genericRequestId and pseudoTools!")
-                owner_usernames = data
-                atlantis._set_owner_usernames(owner_usernames)
-                atlantis._set_owner(owner_usernames[0] if owner_usernames else self.email)
-            else:
-                # Legacy format: single string (email or username)
-                logger.warning(f"⚠️ Welcome message using LEGACY format (single string) - missing genericRequestId and pseudoTools!")
-                atlantis._set_owner(data)
-                atlantis._set_owner_usernames([data] if data else [])
-
+            self._flush_suppressed_connect_errors("Cloud connection recovered")
+            self._reset_connect_error_throttle()
             self.retry_count = 0  # Reset retry counter on successful connection
 
             self.print_ascii_art("../flowcentral.txt")
@@ -4014,10 +3868,11 @@ class ServiceClient:
             await self._report_tools_to_console()
 
 
+
         # Connection error event
         @self.sio.event(namespace=self.namespace)
         def connect_error(data):
-            logger.error(f"❌ DETAILED CLOUD CONNECTION FAILURE INFO: {data}") # Made log distinct
+            self._log_connect_error(data)
 
         # Disconnection event
         @self.sio.event(namespace=self.namespace)
@@ -4276,8 +4131,8 @@ class ServiceClient:
                 logger.info(f"{YELLOW}{'='*60}{RESET}")
                 logger.info(f"{YELLOW}📤 SENDING MCP_RESPONSE TO CLOUD (request_id: {resp_request_id}){RESET}")
                 logger.info(f"{YELLOW}{'='*60}{RESET}")
-                logger.info(f"{YELLOW}{format_json_log(data, colored=True)}{RESET}")
-                logger.info(f"{YELLOW}{'='*60}{RESET}")
+                #logger.debug(f"{YELLOW}{format_json_log(data, colored=True)}{RESET}")
+                #logger.info(f"{YELLOW}{'='*60}{RESET}")
             else:
                 #logger.debug(f"☁️ SENDING MCP MESSAGE via {event}:\n{format_json_log(data) if isinstance(data, dict) else data}")
                 pass
@@ -4360,192 +4215,27 @@ mcp_server = DynamicAdditionServer()
 # Set the server instance in utils immediately so client_log() works
 utils.set_server_instance(mcp_server)
 
-# Custom WebSocket handler for the MCP server
-async def handle_websocket(websocket: WebSocket):
-    # Accept the WebSocket connection with MCP subprotocol
-    await websocket.accept(subprotocol="mcp")
-
-    # Generate a unique client ID based on address
-    client_id = f"ws_{websocket.client.host}_{id(websocket)}"
-
-    # Track this websocket connection both globally and by ID
-    global active_websockets, client_connections
-    active_websockets.add(websocket)
-    client_connections[client_id] = {"type": "websocket", "connection": websocket}
-    connection_count = len(active_websockets)
-
-    logger.info(f"🔌 New WebSocket connection established from {websocket.client.host} (ID: {client_id}, Active: {connection_count})")
-
-    try:
-        # Message loop
-        while True:
-            # Wait for a message from the client
-            message = await websocket.receive_text()
-
-            try:
-                # Parse the message as JSON
-                request_data = json.loads(message)
-
-                # --- Handle Awaitable Command Responses ---
-                if isinstance(request_data, dict) and \
-                   request_data.get("method") == "notifications/commandResult" and \
-                   "params" in request_data:
-
-                    params = request_data["params"]
-                    correlation_id = params.get("correlationId")
-
-                    # Ensure self.mcp_server and awaitable_requests exist
-                    if hasattr(mcp_server, 'awaitable_requests') and \
-                       correlation_id and correlation_id in mcp_server.awaitable_requests:
-
-                        future = mcp_server.awaitable_requests.pop(correlation_id, None)
-                        if future and not future.done():
-                            if "result" in params:
-                                logger.info(f"✅ Received result for awaitable command (correlationId: {correlation_id})")
-                                future.set_result(params["result"])
-                            elif "error" in params:
-                                client_error_details = params["error"]
-                                logger.error(f"❌ Received error from client for awaitable command (correlationId: {correlation_id}): {client_error_details}")
-                                error_data = ErrorData(code=INTERNAL_ERROR, message=f"Client error for command (correlationId: {correlation_id}): {client_error_details}")
-                                future.set_exception(McpError(error_data))
-                            else:
-                                # treat as result
-                                future.set_result(None)
-                            # This message is handled, continue to next message in the loop
-                            logger.debug(f"📥 Handled notifications/commandResult for {correlation_id}, continuing WebSocket loop.")
-                            continue
-                        elif future and future.done():
-                            # Future was already done (e.g., timed out and handled by send_awaitable_client_command)
-                            logger.warning(f"⚠️ Received commandResult for {correlation_id}, but future was already done. Ignoring.")
-                            continue
-                        else:
-                            # Future not found in pop, might have timed out and been removed by send_awaitable_client_command's timeout logic
-                            logger.warning(f"⚠️ Received commandResult for {correlation_id}, but no active future found (pop returned None). Might have timed out. Ignoring.")
-                            continue
-                    else:
-                        # No correlationId or not in awaitable_requests, could be a stray message or an issue.
-                        logger.warning(f"⚠️ Received notifications/commandResult without a valid/pending correlationId: '{correlation_id}'. Passing to standard processing just in case, but this is unusual.")
-                # --- End Awaitable Command Response Handling ---
-
-                logger.debug(f"📥 Received (for MCP processing):\n{format_json_log(request_data)}")
-                logger.warning(f"🟡 WEBSOCKET→process_mcp_request: {request_data.get('method')}")
-                # Process the request using our MCP server (include client_id)
-                response = await process_mcp_request(mcp_server, request_data, client_id)
-
-                # Send the response back to the client
-                #logger.debug(f"📤 Sending: {response}")
-                logger.debug(f"📤 Sending response")
-                await websocket.send_text(json.dumps(response))
-
-            except json.JSONDecodeError:
-                logger.error(f"🚫 Invalid JSON received: {message}")
-                await websocket.send_text(json.dumps({"error": "Invalid JSON"}))
-            except Exception as e:
-                logger.error(f"🚫 Error processing request: {e}")
-                await websocket.send_text(json.dumps({"error": str(e)}))
-
-    except WebSocketDisconnect as e:
-        logger.info(f"☑️ WebSocket client disconnected normally: code={e.code}, reason={e.reason}")
-    except Exception as e:
-        logger.error(f"🛑 WebSocket error: {e}")
-    finally:
-        # Remove this connection from all tracking
-        active_websockets.discard(websocket)
-
-        # Find and remove from client_connections
-        to_remove = []
-        for cid, info in client_connections.items():
-            if info.get("type") == "websocket" and info.get("connection") is websocket:
-                to_remove.append(cid)
-        for cid in to_remove:
-            client_connections.pop(cid, None)
-
-        connection_count = len(active_websockets)
-        logger.info(f"👋 WebSocket connection closed with {websocket.client.host} (Active: {connection_count})")
+async def handle_lobster_socket(websocket: WebSocket):
+    await lobster_socket_handler(
+        websocket,
+        mcp_server=mcp_server,
+        active_websockets=active_websockets,
+        client_connections=client_connections,
+        get_all_tools_for_response=get_all_tools_for_response,
+        server_version=SERVER_VERSION,
+    )
 
 # Process MCP request and generate response
 async def process_mcp_request(server, request, client_id=None):
-    """Process an MCP request and return a response
-
-    Args:
-        server: The MCP server instance
-        request: The request to process
-        client_id: Optional ID of the requesting client for tracking
-    """
-
-    method = request.get("method")
-    logger.warning(f"🟢 WS/HTTP PATH: {method}")
-
-    if "id" not in request:
-        return {"error": "Missing request ID"}
-
-    req_id = request.get("id")
-    params = request.get("params", {})
-
-    # Store client_id in thread-local storage or other request context
-    # This allows tools called during this request to know who's calling
     global current_request_client_id
     current_request_client_id = client_id
-
-    # Route the request to the appropriate handler
-    try:
-        if method == "initialize":
-            # Process initialize request
-            logger.info(f"🚀 Processing 'initialize' request with params:\n{format_json_log(params)}")
-            result = await server.initialize(params)
-            logger.info(f"✅ Successfully processed 'initialize' request")
-            # Return empty object per MCP protocol spec
-            return {"jsonrpc": "2.0", "id": req_id, "result": result}
-        elif method == "tools/list":
-            logger.info(f"🧰 Processing 'tools/list' request via helper for local WebSocket connection")
-            # Local WebSocket connections only see pseudo tools (readme, command)
-            pseudo_tools_list = get_pseudo_tools_for_response(server)
-            if not pseudo_tools_list:
-                logger.error(f"🚨🚨🚨 EMPTY TOOL LIST being returned for tools/list request (ID: {req_id})! "
-                             f"Cloud has not sent pseudoTools in welcome event. "
-                             f"The MCP client will see zero tools available.")
-            response = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"tools": pseudo_tools_list}
-            }
-            logger.info(f"📦 Prepared tools/list response (ID: {req_id}) with {len(pseudo_tools_list)} pseudo tools.")
-            return response
-        elif method == "tools/list_all": # Handling for list_all in direct connections
-            # get all tools including internal
-            # get servers including those not running
-            # Call the core logic method directly (pass client_id)
-            logger.info(f"🧰 Processing 'tools/list_all' request via helper")
-            all_tools_dict_list = await get_all_tools_for_response(server, caller_context="process_mcp_request_websocket")
-            response = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"tools": all_tools_dict_list}
-            }
-            return response
-
-        elif method == "prompts/list":
-            result = await server._get_prompts_list()
-            return {"jsonrpc": "2.0", "id": req_id, "result": {"prompts": result}}
-        elif method == "resources/list":
-            result = await server._get_resources_list()
-            return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": result}}
-        elif method == "tools/call":
-            # Use consolidated handler for standard MCP clients
-            return await server._handle_tools_call(
-                params=params,
-                client_id=client_id,
-                request_id=req_id,
-                for_cloud=False
-            )
-        else:
-            logger.warning(f"⚠️ Unknown method requested: {method}")
-            return {"jsonrpc": "2.0", "id": req_id, "error": f"Unknown method: {method}"}
-    except Exception as e:
-
-        logger.error(f"🚫 Error processing request '{method}': {e}")
-        logger.debug(f"Traceback: {traceback.format_exc()}")
-        return {"jsonrpc": "2.0", "id": req_id, "error": f"Error processing request: {e}"}
+    return await lobster_process_mcp_request(
+        server,
+        request,
+        client_id,
+        get_all_tools_for_response=get_all_tools_for_response,
+        server_version=SERVER_VERSION,
+    )
 
 # Set up the Starlette application with routes
 async def handle_registration(request: Request) -> JSONResponse:
@@ -4696,7 +4386,7 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
 
 app = Starlette(
     routes=[
-        WebSocketRoute("/mcp", endpoint=handle_websocket),
+        WebSocketRoute("/mcp", endpoint=handle_lobster_socket),
         Route("/register", endpoint=handle_registration, methods=["POST"]),
         Route("/mcp", endpoint=handle_mcp_http, methods=["POST"]),
         Route("/health", endpoint=handle_health_check, methods=["GET"])
@@ -4762,10 +4452,6 @@ if __name__ == "__main__":
     logger.info(f"{BRIGHT_WHITE}================{RESET}")
     logger.info(f"")
 
-    # Initialize the MCP server
-    logger.info(f"{BRIGHT_WHITE}🔧 === CALLING SERVER INITIALIZE FROM MAIN ==={RESET}")
-    loop.run_until_complete(mcp_server.initialize())
-
     # Ensure dynamic directories exist
     os.makedirs(FUNCTIONS_DIR, exist_ok=True)
     logger.info(f"📁 Dynamic functions directory: {FUNCTIONS_DIR}")
@@ -4826,7 +4512,7 @@ if __name__ == "__main__":
     try:
         # Start the server
         logger.info(f"🌟 STARTING LOCAL MCP SERVER AT {HOST}:{PORT}")
-        logger.info(f"   📡 WebSocket endpoint: ws://{HOST}:{PORT}/mcp")
+        logger.info(f"   🦞 Lobster socket: ws://{HOST}:{PORT}/mcp")
         logger.info(f"   🌐 HTTP endpoint: http://{HOST}:{PORT}/mcp")
         logger.info(f"   ❤️  Health check: http://{HOST}:{PORT}/health")
 
