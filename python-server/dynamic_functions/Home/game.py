@@ -32,4 +32,4 @@ async def game():
     atlas_path = os.path.join(os.path.dirname(__file__), "atlas_face.jpg")
     await atlantis.client_image(atlas_path)
 
-    await atlantis.client_log(f"Welcome to FlowCentral, {user_id}! Atlas is ready to assist you.")
+    await atlantis.client_log(f"Welcome to FlowCentral, {user_id}! Atlas is ready to assist you. Type /help to see available commands.")
