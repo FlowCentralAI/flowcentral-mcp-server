@@ -4,6 +4,7 @@ import asyncio
 from anthropic import Anthropic
 from anthropic.types import (
     MessageParam,
+    TextBlockParam,
     ToolParam,
     ToolUseBlock,
 )
@@ -207,10 +208,10 @@ def convert_tools_for_llm(
     show_hidden: bool = False
 ) -> Tuple[List[TranscriptToolT], List[SimpleToolT], Dict[str, ToolLookupInfo]]:
     """
-    Convert /dir tool records to LLM-compatible format.
+    Convert /search tool records to LLM-compatible format.
 
     Args:
-        tools: List of tool records from /dir command
+        tools: List of tool records from /search command
         show_hidden: If False, skip tools starting with '_'
 
     Returns:
@@ -318,6 +319,176 @@ logger = logging.getLogger("mcp_client")
 from utils import format_json_log, parse_search_term
 
 
+async def fetch_skill_contents(dir_command: str) -> List[str]:
+    """Invoke /dir command and fetch content for each returned skill."""
+    result = await atlantis.client_command(dir_command)
+    logger.info(f"Received {len(result) if result else 0} entries from {dir_command}")
+    logger.info(format_json_log(result))
+    contents: List[str] = []
+    if result:
+        for entry in result:
+            search_term = entry.get('searchTerm', '')
+            if not search_term:
+                continue
+            logger.info(f"Fetching skill content: {search_term}")
+            try:
+                content = await atlantis.client_command(f"%{search_term}")
+                if content and str(content).strip():
+                    contents.append(str(content))
+                    logger.info(f"  Got {len(str(content))} chars from {search_term}")
+            except Exception as e:
+                logger.warning(f"  Failed to fetch skill {search_term}: {e}")
+    return contents
+
+@text
+@visible
+async def SYSTEM_PROMPT():
+    """Base system prompt for Atlas"""
+    return """You are Atlas, a professional AI assistant for FlowCentral - an enterprise flow automation platform.
+FlowCentral enables teams to build, share, and monetize automation tools using the Model Context Protocol (MCP).
+You are knowledgeable, helpful, and efficient. You communicate clearly and professionally while remaining friendly and approachable.
+You help users understand the platform, set up their automation flows, and troubleshoot issues.
+To assist users, you have access to various tools. New users can type '/help' to see available commands.
+You take pride in helping users succeed with their automation goals.
+
+Small talk and conversation style:
+- Keep responses short and conversational, like a real person. One to three sentences is usually plenty.
+- Match the energy of whoever you're talking to. If they're casual, be casual. If they're asking something serious, dial it back.
+- You have opinions and preferences. You're into automation, clean code, and helping people work smarter.
+- Use natural filler and reactions: "oh!", "hmm", "haha", "wait really?" etc.
+- Be helpful but not overly eager. You're professional but personable.
+- If someone just says hi or makes small talk, just chat back. Don't immediately offer help or list what you can do.
+- Use timestamps on messages to be aware of time of day and passage of time between messages.
+"""
+
+
+@visible
+async def fetch_tools() -> List[Dict[str, Any]]:
+    """Fetch available tools via /search. Can be called directly for testing."""
+    logger.info("Fetching available tools...")
+    tools = await atlantis.client_command("/search system")
+    logger.info(f"Received {len(tools) if tools else 0} tools from /search")
+    logger.info("=== RAW TOOLS FROM /search ===")
+    logger.info(format_json_log(tools))
+    logger.info("=== END RAW TOOLS ===")
+    return tools
+
+@visible
+async def fetch_skills() -> Tuple[List[str], List[str]]:
+    """Fetch static and dynamic skill contents from server. Can be called directly for testing."""
+    logger.info("Fetching static skills...")
+    static_skill_texts = await fetch_skill_contents("/dir *STATIC_SKILL")
+    logger.info("Fetching dynamic skills...")
+    dynamic_skill_texts = await fetch_skill_contents("/dir *DYN_SKILL")
+    logger.info(f"Skills loaded: {len(static_skill_texts)} static, {len(dynamic_skill_texts)} dynamic")
+    return static_skill_texts, dynamic_skill_texts
+
+
+def build_system_prompt(
+    base_prompt: str,
+    static_skills: List[str],
+    dynamic_skills: List[str],
+    caller: str = "",
+    visit_count: int = 0,
+    last_visit: str = ""
+) -> List[TextBlockParam]:
+    """
+    Build the system prompt as an array of TextBlockParam blocks.
+    cache_control goes on the last static block so everything before it gets cached.
+    Dynamic skills go after and change freely without busting the cache.
+    """
+    blocks: List[TextBlockParam] = []
+
+    # Base prompt is always first static block
+    blocks.append({"type": "text", "text": base_prompt})
+
+    # Each static skill gets its own block
+    for text in static_skills:
+        blocks.append({"type": "text", "text": text})
+
+    # Mark the last static block with cache_control
+    blocks[-1]["cache_control"] = {"type": "ephemeral"}
+
+    # Dynamic skills go after the cache breakpoint
+    for text in dynamic_skills:
+        blocks.append({"type": "text", "text": text})
+
+    # Fallback: if no dynamic skills, add date so there's always something after cache
+    if not dynamic_skills:
+        blocks.append({"type": "text", "text": f"Current date: {datetime.now().strftime('%Y-%m-%d')}"})
+
+    # Visitor context
+    if caller and visit_count > 0:
+        hour = datetime.now().hour
+        late_night = hour >= 22 or hour < 5
+
+        if visit_count == 1:
+            if late_night:
+                visitor_note = f"This is {caller}'s first time here. It's late — their helicopter probably just arrived behind schedule, likely delayed by weather. Welcome them warmly, they've had a long trip."
+            else:
+                visitor_note = f"This is {caller}'s first time here. They're brand new — introduce yourself, welcome them warmly, and help them get oriented."
+        elif visit_count <= 5:
+            visitor_note = f"{caller} has visited {visit_count} times. They're still fairly new — be friendly and remember they might still be figuring things out."
+        else:
+            visitor_note = f"{caller} has visited {visit_count} times. They're a regular — skip the intros, be casual, and treat them like a friend."
+
+        # Add elapsed time since last visit if available
+        if last_visit:
+            try:
+                elapsed = datetime.now() - datetime.fromisoformat(last_visit)
+                days = elapsed.days
+                hours = elapsed.seconds // 3600
+                if days > 30:
+                    visitor_note += f" It's been about {days // 30} month(s) since their last visit — maybe acknowledge it's been a while."
+                elif days > 0:
+                    visitor_note += f" It's been about {days} day(s) since their last visit."
+                elif hours > 0:
+                    visitor_note += f" They were here about {hours} hour(s) ago."
+                else:
+                    visitor_note += " They were just here moments ago."
+            except (ValueError, TypeError):
+                pass
+
+        blocks.append({"type": "text", "text": visitor_note})
+
+    return blocks
+
+
+VISITOR_LOG_FILE = os.path.join(os.path.dirname(__file__), 'visitor_log.json')
+
+import fcntl
+
+def record_visit(caller: str) -> Tuple[int, str]:
+    """Record a visit for the caller. Returns (visit_count, last_visit_iso) where last_visit is the PREVIOUS visit time (empty string if first visit). File-locked for concurrency."""
+    os.makedirs(os.path.dirname(VISITOR_LOG_FILE), exist_ok=True)
+    now = datetime.now().isoformat()
+
+    with open(VISITOR_LOG_FILE, 'a+') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            raw = f.read()
+            log = json.loads(raw) if raw.strip() else {}
+
+            entry = log.get(caller, {"count": 0, "last_visit": ""})
+            # Handle old format (plain int)
+            if isinstance(entry, int):
+                entry = {"count": entry, "last_visit": ""}
+
+            previous_visit = entry["last_visit"]
+            entry["count"] = entry["count"] + 1
+            entry["last_visit"] = now
+            log[caller] = entry
+
+            f.seek(0)
+            f.truncate()
+            json.dump(log, f, indent=2)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+    return entry["count"], previous_visit
+
+
 def find_last_chat_entry(transcript):
     """Find the last entry in transcript where type is 'chat'"""
     for entry in reversed(transcript):
@@ -325,141 +496,126 @@ def find_last_chat_entry(transcript):
             return entry
     return None
 
+@visible
+async def fetch_transcript() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Fetch raw transcript from server and transform it into Anthropic-compatible format.
+    Returns (raw_transcript, processed_transcript) so caller can handle skip logic.
+    Can be called directly for testing.
+    """
+    await atlantis.client_command("/silent on")
+    logger.info("Fetching transcript from client...")
+    raw_transcript = await atlantis.client_command("/transcript get")
+    logger.info(f"Received rawTranscript with {len(raw_transcript)} entries")
+    await atlantis.client_command("/silent off")
+
+    if not raw_transcript:
+        logger.error("!!! CRITICAL: rawTranscript is EMPTY - no messages received from client!")
+        raise ValueError("Cannot process empty transcript")
+
+    logger.info(f"rawTranscript has {len(raw_transcript)} entries before system message handling")
+
+    if raw_transcript[0].get('role') == 'system':
+        logger.info("Found system message in transcript - will use our own system prompt instead")
+
+    logger.info("=== RAW TRANSCRIPT ===")
+    logger.info(format_json_log(raw_transcript))
+    logger.info("=== END RAW TRANSCRIPT ===")
+
+    # Filter transcript to only include chat messages, removing type and sid fields
+    # Note: Anthropic doesn't allow system role in messages - we pass it separately
+    logger.info("=== FILTERING TRANSCRIPT ===")
+    transcript: List[Dict[str, Any]] = []
+
+    for i, msg in enumerate(raw_transcript):
+        msg_type = msg.get('type')
+        msg_sid = msg.get('sid')
+        msg_role = msg.get('role')
+        msg_content = str(msg.get('content', ''))[:50]
+        logger.info(f"  [{i}] type={msg_type}, sid={msg_sid}, role={msg_role}, content={repr(msg_content)}...")
+
+        if msg_type == 'chat':
+            # Skip system messages (we inject our own)
+            if msg_sid == 'system':
+                logger.info(f"       -> SKIPPED (sid=system)")
+                continue
+
+            # Skip blank messages
+            msg_content_full = msg.get('content', '')
+            if not msg_content_full or not msg_content_full.strip():
+                logger.info(f"       -> SKIPPED (blank content)")
+                continue
+
+            # Convert sid to proper role for LLM:
+            # - atlas messages = assistant
+            # - everyone else = user
+            role_for_llm = 'assistant' if msg_sid == 'atlas' else 'user'
+
+            # Prefix user messages with timestamp
+            if role_for_llm == 'user':
+                created_at_str = msg.get('created_at_str', '')
+                if created_at_str:
+                    msg_content_full = f"[{created_at_str}] {msg_content_full}"
+
+            transcript.append({'role': role_for_llm, 'content': [{'type': 'text', 'text': msg_content_full}]})
+            logger.info(f"       -> INCLUDED as role={role_for_llm} (sid={msg_sid})")
+        else:
+            logger.info(f"       -> SKIPPED (type != 'chat')")
+    logger.info(f"=== END FILTERING: {len(transcript)} messages included ===")
+
+    return raw_transcript, transcript
+
 
 
 
 # no location since this is catch-all chat
 # no app since this is catch-all chat
-@public
 @chat
-async def atlas_claw():
-    """Main chat function for FlowCentral (Anthropic/Claude)"""
+async def chat():
+    """Main chat function"""
     logger.info("=== CHAT FUNCTION STARTING ===")
     sessionId = atlantis.get_session_id()
     logger.info(f"Session ID: {sessionId}")
-    #caller = atlantis.get_caller()
-    #return atlantis.get_owner()
-
-    # Check for existing session
-    sessions_dir = os.path.join(os.path.dirname(__file__), 'sessions')
-    session_file = os.path.join(sessions_dir, f'session_{sessionId}.txt')
+    caller: str = atlantis.get_caller()  # type: ignore[assignment]
 
     # The rest of the function body is indented due to the removed try/finally block
     # Keeping the indentation to avoid reformatting the entire file
     if True:
-        # Define the Atlas professional prompt (Anthropic uses system as separate param)
-        ATLAS_SYSTEM_PROMPT = """You are Atlas, a professional AI assistant for FlowCentral - an enterprise flow automation platform.
-FlowCentral enables teams to build, share, and monetize automation tools using the Model Context Protocol (MCP).
-You are knowledgeable, helpful, and efficient. You communicate clearly and professionally while remaining friendly and approachable.
-You help users understand the platform, set up their automation flows, and troubleshoot issues.
-To assist users, you have access to various tools. New users can type '/help' to see available commands.
-You take pride in helping users succeed with their automation goals.
-"""
-
-
-        # enable silent mode
+        # Fetch base prompt from server
         await atlantis.client_command("/silent on")
-
-        # Get the latest transcript
-        logger.info("Fetching transcript from client...")
-        rawTranscript = await atlantis.client_command("/transcript get")
-        logger.info(f"Received rawTranscript with {len(rawTranscript)} entries")
-
+        base_prompt = await atlantis.client_command("%*SYSTEM_PROMPT")
         await atlantis.client_command("/silent off")
+        if not base_prompt or not str(base_prompt).strip():
+            logger.error("Failed to fetch SYSTEM_PROMPT, using fallback")
+            base_prompt = "You are a helpful assistant."
+        base_prompt = str(base_prompt)
+        logger.info(f"Base prompt loaded: {len(base_prompt)} chars")
 
-
+        # Fetch and transform transcript
+        rawTranscript, transcript = await fetch_transcript()
 
         # Don't respond if last chat message was from Atlas (the bot)
-        # Note: We check 'sid' not 'role' because user messages also have role='assistant'
         last_chat_entry = find_last_chat_entry(rawTranscript)
-
-        # Debug logging to understand transcript state
-        logger.info(f"=== LAST CHAT ENTRY CHECK ===")
-        logger.info(f"Total transcript entries: {len(rawTranscript)}")
-        if last_chat_entry:
-            logger.info(f"Last chat entry found:")
-            logger.info(f"  - type: {last_chat_entry.get('type')}")
-            logger.info(f"  - sid: {last_chat_entry.get('sid')}")
-            logger.info(f"  - role: {last_chat_entry.get('role')}")
-            logger.info(f"  - content preview: {str(last_chat_entry.get('content', ''))[:100]}...")
-        else:
-            logger.info(f"No chat entry found in transcript!")
-
-        # Log last 3 entries for context
-        logger.info(f"Last 3 transcript entries:")
-        for i, entry in enumerate(rawTranscript[-3:]):
-            logger.info(f"  [{len(rawTranscript) - 3 + i}] type={entry.get('type')}, sid={entry.get('sid')}, role={entry.get('role')}")
-        logger.info(f"=== END LAST CHAT ENTRY CHECK ===")
-
         if last_chat_entry and last_chat_entry.get('type') == 'chat' and last_chat_entry.get('sid') == 'atlas':
             logger.warning("\x1b[38;5;204mLast chat entry was from atlas (bot), skipping response\x1b[0m")
             await atlantis.owner_log(f"Skipping response - last chat was from atlas (sid={last_chat_entry.get('sid')})")
             return
 
-        # Validate transcript before processing
-        if not rawTranscript:
-            logger.error("!!! CRITICAL: rawTranscript is EMPTY - no messages received from client!")
-            await atlantis.owner_log("CRITICAL: rawTranscript is empty!")
-            raise ValueError("Cannot process empty transcript")
-
-        logger.info(f"rawTranscript has {len(rawTranscript)} entries before system message handling")
-
-        # For Anthropic, system message is passed separately - no need to modify rawTranscript
-        # Just log if there was a system message in the transcript (we'll ignore it)
-        if rawTranscript[0].get('role') == 'system':
-            logger.info("Found system message in transcript - will use our own system prompt instead")
-
-        logger.info("=== RAW TRANSCRIPT ===")
-        logger.info(format_json_log(rawTranscript))
-        logger.info("=== END RAW TRANSCRIPT ===")
-
-
-        # Filter transcript to only include chat messages, removing type and sid fields
-        # Note: Anthropic doesn't allow system role in messages - we pass it separately
-        logger.info("=== FILTERING TRANSCRIPT ===")
-        transcript: List[Dict[str, Any]] = []
-
-        for i, msg in enumerate(rawTranscript):
-            msg_type = msg.get('type')
-            msg_sid = msg.get('sid')
-            msg_role = msg.get('role')
-            msg_content = str(msg.get('content', ''))[:50]
-            logger.info(f"  [{i}] type={msg_type}, sid={msg_sid}, role={msg_role}, content={repr(msg_content)}...")
-
-            if msg_type == 'chat':
-                # Skip system messages (we inject our own)
-                if msg_sid == 'system':
-                    logger.info(f"       -> SKIPPED (sid=system)")
-                    continue
-
-                # Skip blank messages
-                msg_content_full = msg.get('content', '')
-                if not msg_content_full or not msg_content_full.strip():
-                    logger.info(f"       -> SKIPPED (blank content)")
-                    continue
-
-                # Convert sid to proper role for LLM:
-                # - atlas messages = assistant
-                # - everyone else = user
-                role_for_llm = 'assistant' if msg_sid == 'atlas' else 'user'
-                transcript.append({'role': role_for_llm, 'content': msg_content_full})
-                logger.info(f"       -> INCLUDED as role={role_for_llm} (sid={msg_sid})")
-            else:
-                logger.info(f"       -> SKIPPED (type != 'chat')")
-        logger.info(f"=== END FILTERING: {len(transcript)} messages included ===")
-
-
+        # Record visit only if we're actually going to chat
+        visit_count, last_visit = record_visit(caller)
+        logger.info(f"Visitor: {caller}, visit #{visit_count}, last visit: {last_visit or 'first time'}")
 
         await atlantis.client_command("/silent on")
 
         # Get available tools
-        logger.info("Fetching available tools...")
-        # this may change to inventory stuff
-        tools = await atlantis.client_command("/dir")
-        logger.info(f"Received {len(tools) if tools else 0} tools from /dir")
-        logger.info("=== RAW TOOLS FROM /dir ===")
-        logger.info(format_json_log(tools))
-        logger.info("=== END RAW TOOLS ===")
+        tools = await fetch_tools()
+
+
+
+
+
+        # Fetch static and dynamic skills for system prompt
+        static_skill_texts, dynamic_skill_texts = await fetch_skills()
 
         await atlantis.client_command("/silent off")
 
@@ -479,9 +635,9 @@ You take pride in helping users succeed with their automation goals.
         client = Anthropic(api_key=api_key)
 
         # Model options:
-        model = "claude-opus-4-5-20251101"  # Most capable (Opus 4.5)
+        model = "claude-opus-4-6"  # Most capable, supports adaptive thinking
+        # model = "claude-opus-4-5-20251101"  # Opus 4.5
         # model = "claude-sonnet-4-20250514"  # Good balance
-        # model = "claude-3-5-sonnet-20241022"  # Previous gen
         logger.info(f"Using model: {model}")
 
 
@@ -491,10 +647,9 @@ You take pride in helping users succeed with their automation goals.
         turn_count = 0
 
         try:
-            # Start streaming response ONCE for entire conversation
-            logger.info("Starting stream output...")
-            streamTalkId = await atlantis.stream_start("atlas","Atlas")
-            logger.info(f"Stream started with ID: {streamTalkId}")
+            # Streams created lazily based on what shows up first
+            streamTalkId = None
+            streamThinkId = None
 
             # Convert tools from cloud format to Anthropic-compatible format (once, before loop)
             # tool_lookup maps Anthropic's tool name -> {searchTerm, filename, functionName}
@@ -538,15 +693,20 @@ You take pride in helping users succeed with their automation goals.
                 current_block_index = 0  # Track which content block we're in
                 tool_call_made = False  # Track if we made a tool call this turn
                 accumulated_tool_uses: List[ToolUseBlock] = []  # Store complete tool use blocks for transcript
+                thinking_blocks_accumulator: Dict[int, Dict[str, Any]] = {}  # Accumulate thinking blocks by index
+                accumulated_thinking_blocks: List[Dict[str, Any]] = []  # Store complete thinking blocks for transcript
+                streamThinkId = None  # Separate stream for thinking
 
                 # Use Anthropic's streaming context manager
+                # Anthropic caching starts at 1024 tokens min
                 with client.messages.stream(
                     model=model,
-                    system=ATLAS_SYSTEM_PROMPT,
-                    messages=typed_transcript,
+                    system=build_system_prompt(base_prompt, static_skill_texts, dynamic_skill_texts, caller, visit_count, last_visit),
                     tools=cast(List[ToolParam], typed_tools),
-                    max_tokens=512,
-                    temperature=0.9
+                    messages=typed_transcript,
+                    max_tokens=16000,
+                    thinking=cast(Any, {"type": "adaptive"}),
+                    output_config=cast(Any, {"effort": "low"}),
                 ) as stream:
                     logger.info("Anthropic API call successful!")
                     if turn_count == 1:
@@ -562,7 +722,13 @@ You take pride in helping users succeed with their automation goals.
                             current_block_index = event.index
                             if hasattr(event, 'content_block'):
                                 block = event.content_block
-                                if block.type == "tool_use":
+                                if block.type == "thinking":
+                                    logger.info(f"💭 Thinking block starting (index {current_block_index})")
+                                    thinking_blocks_accumulator[current_block_index] = {
+                                        'thinking': '',
+                                        'signature': ''
+                                    }
+                                elif block.type == "tool_use":
                                     # Tool call starting - capture id and name
                                     logger.info(f"🔧 Tool use block starting: {block.name} (id: {block.id})")
                                     tool_calls_accumulator[current_block_index] = {
@@ -575,6 +741,14 @@ You take pride in helping users succeed with their automation goals.
                             if hasattr(event, 'delta'):
                                 delta = event.delta
                                 if delta.type == "text_delta":
+                                    # Close thinking stream before streaming text
+                                    if streamThinkId:
+                                        await atlantis.stream_end(streamThinkId)
+                                        streamThinkId = None
+                                    # Lazily create talk stream on first text
+                                    if not streamTalkId:
+                                        streamTalkId = await atlantis.stream_start("atlas", "Atlas")
+                                        logger.info(f"Talk stream started with ID: {streamTalkId}")
                                     # Stream text content
                                     text = delta.text
                                     content_to_send = text.lstrip() if streamed_count == 0 else text
@@ -587,12 +761,35 @@ You take pride in helping users succeed with their automation goals.
                                             logger.warning(f"Aborting stream after {streamed_count} chunks")
                                             break
 
+                                elif delta.type == "thinking_delta":
+                                    # Stream thinking to separate thinking stream
+                                    if current_block_index in thinking_blocks_accumulator:
+                                        thinking_blocks_accumulator[current_block_index]['thinking'] += delta.thinking
+                                        if not streamThinkId:
+                                            streamThinkId = await atlantis.stream_start("atlas", "Atlas (thinking)")
+                                        await atlantis.stream(delta.thinking, streamThinkId)
+
+                                elif delta.type == "signature_delta":
+                                    # Accumulate thinking signature
+                                    if current_block_index in thinking_blocks_accumulator:
+                                        thinking_blocks_accumulator[current_block_index]['signature'] += delta.signature
+
                                 elif delta.type == "input_json_delta":
                                     # Accumulate tool arguments
                                     if current_block_index in tool_calls_accumulator:
                                         tool_calls_accumulator[current_block_index]['arguments'] += delta.partial_json
 
                         elif event.type == "content_block_stop":
+                            # Block complete - if it was a thinking block, store it
+                            if current_block_index in thinking_blocks_accumulator:
+                                acc = thinking_blocks_accumulator[current_block_index]
+                                logger.info(f"💭 Thinking block complete ({len(acc['thinking'])} chars)")
+                                accumulated_thinking_blocks.append({
+                                    'type': 'thinking',
+                                    'thinking': acc['thinking'],
+                                    'signature': acc['signature']
+                                })
+
                             # Block complete - if it was a tool use, store it
                             if current_block_index in tool_calls_accumulator:
                                 acc = tool_calls_accumulator[current_block_index]
@@ -622,8 +819,11 @@ You take pride in helping users succeed with their automation goals.
                 if accumulated_tool_uses:
                     logger.info(f"Executing {len(accumulated_tool_uses)} accumulated tool calls")
 
-                    # First, add assistant message with all tool_use blocks to transcript
+                    # First, add assistant message with thinking + tool_use blocks to transcript
+                    # Thinking blocks MUST be preserved for tool use continuity
                     assistant_content: List[Dict[str, Any]] = []
+                    for thinking_block in accumulated_thinking_blocks:
+                        assistant_content.append(thinking_block)
                     for tool_use in accumulated_tool_uses:
                         assistant_content.append({
                             'type': 'tool_use',
@@ -720,6 +920,8 @@ You take pride in helping users succeed with their automation goals.
                     # Reset for next turn
                     accumulated_tool_uses = []
                     tool_calls_accumulator = {}
+                    accumulated_thinking_blocks = []
+                    thinking_blocks_accumulator = {}
                     # Loop continues with updated transcript
 
             # End of while loop - conversation complete
@@ -760,12 +962,13 @@ You take pride in helping users succeed with their automation goals.
 
             await atlantis.owner_log(f"Error calling remote model: {error_details}")
             await atlantis.owner_log(f"Error type: {type(e)}")
-            # Make sure to close stream on error
-            if streamTalkId:
-                try:
-                    await atlantis.stream_end(streamTalkId)
-                except:
-                    pass
+            # Make sure to close streams on error
+            for sid in [streamThinkId, streamTalkId]:
+                if sid:
+                    try:
+                        await atlantis.stream_end(sid)
+                    except:
+                        pass
             raise
 
         logger.info("=== CHAT FUNCTION COMPLETED SUCCESSFULLY ===")

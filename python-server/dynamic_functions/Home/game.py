@@ -4,12 +4,9 @@ import os
 
 logger = logging.getLogger("mcp_server")
 
-@public
 @game
 async def game():
-    """
-    Main game function - initializes FlowCentral session
-    """
+    """Initializes a new chat session with Atlas as the default chat bot"""
 
     await atlantis.client_command("/silent on")
 
@@ -20,7 +17,8 @@ async def game():
     owner_id = atlantis.get_owner()
     await atlantis.client_log(f"Owner ID: {owner_id}")
 
-    await atlantis.client_command("/chat set " + owner_id + "*atlas")
+    atlasPath = owner_id + "**Bot.Atlas.Ant**chat"
+    await atlantis.client_command("/chat set " + atlasPath)
 
     # set background
     await atlantis.client_command("/silent off")
