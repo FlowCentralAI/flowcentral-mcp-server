@@ -370,7 +370,7 @@ Small talk and conversation style:
 async def fetch_tools() -> List[Dict[str, Any]]:
     """Fetch available tools via /search. Can be called directly for testing."""
     logger.info("Fetching available tools...")
-    tools = await atlantis.client_command("/search foobar")
+    tools = await atlantis.client_command("/search system")
     logger.info(f"Received {len(tools) if tools else 0} tools from /search")
     logger.info("=== RAW TOOLS FROM /search ===")
     logger.info(format_json_log(tools))
@@ -382,7 +382,6 @@ async def fetch_skills() -> Tuple[List[str], List[str]]:
     """Fetch static and dynamic skill contents from server. Can be called directly for testing."""
     logger.info("Fetching static skills...")
     static_skill_texts = await fetch_skill_contents("/dir *STATIC_SKILL")
-
     logger.info("Fetching dynamic skills...")
     dynamic_skill_texts = await fetch_skill_contents("/dir *DYN_SKILL")
     logger.info(f"Skills loaded: {len(static_skill_texts)} static, {len(dynamic_skill_texts)} dynamic")
@@ -591,7 +590,7 @@ _session_locks: Dict[str, asyncio.Lock] = {}
 # no app since this is catch-all chat
 @chat
 async def chat():
-    """Anthropic opus 4.6 chat"""
+    """Opus 4.6 via open router"""
     logger.info("=== CHAT FUNCTION STARTING ===")
     sessionId = atlantis.get_session_id()
     logger.info(f"Session ID: {sessionId}")
@@ -646,23 +645,23 @@ async def chat():
 
 
         # uses env var
-        # Configure Anthropic client
-        logger.info("Configuring Anthropic client...")
+        # Configure OpenRouter client (Anthropic-compatible API)
+        logger.info("Configuring OpenRouter client...")
 
         # Check for API key
-        api_key = os.getenv("ANTHROPIC_API_KEY")
+        api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
-            error_msg = "ANTHROPIC_API_KEY environment variable is not set"
+            error_msg = "OPENROUTER_API_KEY environment variable is not set"
             logger.error(error_msg)
             await atlantis.owner_log(error_msg)
             raise ValueError(error_msg)
 
-        client = Anthropic(api_key=api_key)
+        client = Anthropic(api_key=api_key, base_url="https://openrouter.ai/api")
 
-        # Model options:
-        model = "claude-opus-4-6"  # Most capable, supports adaptive thinking
-        # model = "claude-opus-4-5-20251101"  # Opus 4.5
-        # model = "claude-sonnet-4-20250514"  # Good balance
+        # Model options (OpenRouter model IDs):
+        model = "anthropic/claude-opus-4-6"
+        # model = "anthropic/claude-sonnet-4"
+        # model = "google/gemini-2.5-pro"
         logger.info(f"Using model: {model}")
 
 
@@ -703,8 +702,8 @@ async def chat():
                 # Cast transcript to proper type for Anthropic client
                 typed_transcript = cast(List[MessageParam], transcript)
 
-                # Log what we're actually sending to Anthropic
-                logger.info(f"=== SENDING TO ANTHROPIC (OPUS) (turn {turn_count}) ===")
+                # Log what we're actually sending
+                logger.info(f"=== SENDING TO OPENROUTER (OPUS) (turn {turn_count}) ===")
                 logger.info(f"Messages: {len(typed_transcript)} entries")
                 logger.info(f"Tools: {len(typed_tools)} entries")
                 logger.info(f"Tool names sent to Anthropic: {[t['name'] for t in typed_tools]}")

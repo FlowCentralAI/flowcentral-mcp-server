@@ -84,7 +84,6 @@ Functions are **hidden by default** - you must use a visibility decorator to exp
 ### Optional Metadata
 - **`@copy`** - Allow non-owners to view function source via `_function_get` (based on visibility rules)
 - **`@chat`** - Chat functions that get transcript/tools and call LLM
-- **`@app(name="app_name")`** - Associate with specific app (DEPRECATED, use folders)
 - **`@location(name="location_name")`** - Associate with location
 - **`@shared`** - Persist across reloads
 
@@ -93,11 +92,10 @@ Functions are **hidden by default** - you must use a visibility decorator to exp
 
 **Combine decorators:**
 ```python
-@app(name="calculator")
 @location(name="office")
 @visible
 async def calculate(x: float, y: float):
-    """Calculate with app and location context."""
+    """Calculate with location context."""
     return x + y
 ```
 
@@ -348,6 +346,24 @@ async def chat():
     await atlantis.stream_end(stream_id)
 ```
 
+### Choosing a Bot Variant
+
+The `Bot/Atlas/` directory contains multiple bot variants (e.g. `Ant`, `OpenRouterAnt`, `OpenRouterGLM`). Each has its own `SYSTEM_PROMPT` function marked `@visible`. The `game.py` file in `Home/` controls which bot is used by setting the chat path (e.g. `Bot.Atlas.OpenRouterGLM`).
+
+**Important:** If multiple bot variants have `@visible` on their `SYSTEM_PROMPT`, the system will return a "Too many matching tools" error when the active bot tries to fetch its prompt via `*SYSTEM_PROMPT`. To avoid this, **remove `@visible` from the `SYSTEM_PROMPT` in any bot variants you are not using**. Only the active bot's `SYSTEM_PROMPT` should be `@visible`.
+
+For example, if you switch to the `Ant` bot:
+1. Update `game.py` to point to `Bot.Atlas.Ant**chat`
+2. Remove `@visible` from `SYSTEM_PROMPT` in `OpenRouterGLM/main.py` and `OpenRouterAnt/main.py`
+3. Keep `@visible` on `SYSTEM_PROMPT` in `Ant/main.py`
+
+### Multi-user Access
+
+By default, bots are owner-only. To allow other users to connect and use your bot automatically, add `@public` to:
+- `game()` in `Home/game.py` — so connecting users trigger the game/greeting
+- `chat()` in your active bot — so users can chat with the bot
+- `SYSTEM_PROMPT()` in your active bot — so the bot can fetch its personality prompt for any user
+
 ## Type Hints
 
 Type hints generate JSON schemas automatically:
@@ -488,7 +504,7 @@ Local WebSocket clients see **pseudo tools** that act as a routing layer to clou
 // Welcome message payload from cloud
 interface WelcomeMessage {
   usernames: string[];
-  genericRequestId: string;   // required - fatal error if missing
+  lobsterRequestId: string;   // required - fatal error if missing
   pseudoTools: PseudoTool[];  // tool definitions for local clients
 }
 ```

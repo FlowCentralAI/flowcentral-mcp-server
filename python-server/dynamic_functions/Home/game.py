@@ -17,7 +17,7 @@ async def game():
     owner_id = atlantis.get_owner()
     await atlantis.client_log(f"Owner ID: {owner_id}")
 
-    atlasPath = owner_id + "**Bot.Atlas.Ant**chat"
+    atlasPath = owner_id + "**Bot.Atlas.OpenRouterGLM**chat"
     await atlantis.client_command("/chat set " + atlasPath)
 
     # set background
