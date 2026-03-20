@@ -348,14 +348,14 @@ async def chat():
 
 ### Choosing a Bot Variant
 
-The `Bot/Atlas/` directory contains multiple bot variants (e.g. `Ant`, `OpenRouterAnt`, `OpenRouterGLM`). Each has its own `SYSTEM_PROMPT` function marked `@visible`. The `game.py` file in `Home/` controls which bot is used by setting the chat path (e.g. `Bot.Atlas.OpenRouterGLM`).
+The `Bot/Atlas/` directory contains multiple bot variants (e.g. `Ant`, `OpenRouterAnt`, `OpenRouterGLM`). Each has its own `SYSTEM_PROMPT` function. The `game.py` file in `Home/` controls which bot is used by setting the chat path (e.g. `Bot.Atlas.OpenRouterGLM`).
 
-**Important:** If multiple bot variants have `@visible` on their `SYSTEM_PROMPT`, the system will return a "Too many matching tools" error when the active bot tries to fetch its prompt via `*SYSTEM_PROMPT`. To avoid this, **remove `@visible` from the `SYSTEM_PROMPT` in any bot variants you are not using**. Only the active bot's `SYSTEM_PROMPT` should be `@visible`.
+**Important:** Both `@visible` and `@text` decorators make functions discoverable via wildcard search (e.g. `*SYSTEM_PROMPT`). If multiple bot variants have decorated `SYSTEM_PROMPT` functions, the system will return a "Too many matching tools" error. To avoid this, **remove all decorators from `SYSTEM_PROMPT` in any bot variants you are not using**. Only the active bot's `SYSTEM_PROMPT` should have decorators.
 
-For example, if you switch to the `Ant` bot:
+For example, if you switch from the default `OpenRouterGLM` to the `Ant` bot:
 1. Update `game.py` to point to `Bot.Atlas.Ant**chat`
-2. Remove `@visible` from `SYSTEM_PROMPT` in `OpenRouterGLM/main.py` and `OpenRouterAnt/main.py`
-3. Keep `@visible` on `SYSTEM_PROMPT` in `Ant/main.py`
+2. Remove all decorators (`@text`, `@visible`, etc.) from `SYSTEM_PROMPT` in `OpenRouterGLM/main.py` and `OpenRouterAnt/main.py`
+3. Ensure `SYSTEM_PROMPT` in `Ant/main.py` has `@text` and `@visible` so the bot can find its prompt
 
 ### Multi-user Access
 
