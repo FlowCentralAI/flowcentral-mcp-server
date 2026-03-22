@@ -4,6 +4,7 @@ import os
 
 logger = logging.getLogger("mcp_server")
 
+@public
 @game
 async def game():
     """Initializes a new chat session with Atlas as the default chat bot"""
@@ -15,7 +16,7 @@ async def game():
     logger.info(f"Game started for user: {user_id}")
 
     owner_id = atlantis.get_owner()
-    await atlantis.client_log(f"Owner ID: {owner_id}")
+    #await atlantis.client_log(f"Owner ID: {owner_id}")  # TEMP
 
     atlasPath = owner_id + "**Bot.Atlas.OpenRouterGLM**chat"
     await atlantis.client_command("/chat set " + atlasPath)

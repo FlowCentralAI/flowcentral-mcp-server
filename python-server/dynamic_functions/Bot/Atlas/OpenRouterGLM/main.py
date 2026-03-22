@@ -328,27 +328,6 @@ async def fetch_skill_contents(dir_command: str) -> List[str]:
                 logger.warning(f"  Failed to fetch skill {search_term}: {e}")
     return contents
 
-@text
-@visible
-async def SYSTEM_PROMPT():
-    """Base system prompt for Atlas"""
-    return """You are Atlas, a professional AI assistant for FlowCentral - an enterprise flow automation platform.
-FlowCentral enables teams to build, share, and monetize automation tools using the Model Context Protocol (MCP).
-You are knowledgeable, helpful, and efficient. You communicate clearly and professionally while remaining friendly and approachable.
-You help users understand the platform, set up their automation flows, and troubleshoot issues.
-To assist users, you have access to various tools. New users can type '/help' to see available commands.
-You take pride in helping users succeed with their automation goals.
-
-Small talk and conversation style:
-- Keep responses short and conversational, like a real person. One to three sentences is usually plenty.
-- Match the energy of whoever you're talking to. If they're casual, be casual. If they're asking something serious, dial it back.
-- You have opinions and preferences. You're into automation, clean code, and helping people work smarter.
-- Use natural filler and reactions: "oh!", "hmm", "haha", "wait really?" etc.
-- Be helpful but not overly eager. You're professional but personable.
-- If someone just says hi or makes small talk, just chat back. Don't immediately offer help or list what you can do.
-- Use timestamps on messages to be aware of time of day and passage of time between messages.
-"""
-
 
 @visible
 async def fetch_tools() -> List[Dict[str, Any]]:
@@ -385,8 +364,8 @@ def build_system_prompt(
     for text in skills:
         parts.append(text)
 
-    # Always include current date
-    parts.append(f"Current date: {datetime.now().strftime('%Y-%m-%d')}")
+    # Always include current date and time
+    parts.append(f"Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
     # Visitor context
     if caller and visit_count > 0:
@@ -395,7 +374,7 @@ def build_system_prompt(
 
         if visit_count == 1:
             if late_night:
-                visitor_note = f"This is {caller}'s first time here. It's late — welcome them warmly."
+                visitor_note = f"This is {caller}'s first time here. It's late — their helicopter probably just arrived behind schedule, likely delayed by weather. Welcome them warmly, they've had a long trip."
             else:
                 visitor_note = f"This is {caller}'s first time here. They're brand new — introduce yourself, welcome them warmly, and help them get oriented."
         elif visit_count <= 5:
@@ -424,44 +403,196 @@ def build_system_prompt(
     return "\n\n".join(parts)
 
 
-VISITOR_LOG_FILE = os.path.join(os.path.dirname(__file__), 'visitor_log.json')
+VISITOR_LOG_FILE = os.path.join(os.path.dirname(__file__), '..', 'visitor_log.json')
 
 import fcntl
 
-def record_visit(caller: str) -> Tuple[int, str]:
-    """Record a visit for the caller. Returns (visit_count, last_visit_iso) where last_visit is the PREVIOUS visit time (empty string if first visit). File-locked for concurrency."""
+def get_visit_info(caller: str) -> Tuple[int, str]:
+    """Get visit info for the caller. Returns (visit_count, last_visit_iso). Does not modify the log."""
     os.makedirs(os.path.dirname(VISITOR_LOG_FILE), exist_ok=True)
-    now = datetime.now().isoformat()
 
+    try:
+        with open(VISITOR_LOG_FILE, 'r') as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                raw = f.read()
+                log = json.loads(raw) if raw.strip() else {}
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return 0, ""
+
+    entry = log.get(caller, {"count": 0, "last_visit": ""})
+    if isinstance(entry, int):
+        entry = {"count": entry, "last_visit": ""}
+
+    return entry["count"], entry["last_visit"]
+
+
+def record_new_conversation(caller: str):
+    """Increment visit count and update timestamp. Called on first visit or when >1hr gap detected."""
+    now = datetime.now().isoformat()
     with open(VISITOR_LOG_FILE, 'a+') as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
             f.seek(0)
             raw = f.read()
             log = json.loads(raw) if raw.strip() else {}
-
             entry = log.get(caller, {"count": 0, "last_visit": ""})
             if isinstance(entry, int):
                 entry = {"count": entry, "last_visit": ""}
-
-            previous_visit = entry["last_visit"]
             entry["count"] = entry["count"] + 1
             entry["last_visit"] = now
             log[caller] = entry
-
             f.seek(0)
             f.truncate()
             json.dump(log, f, indent=2)
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+    logger.info(f"New conversation for {caller}: visit #{entry['count']}, timestamp {now}")
 
-    return entry["count"], previous_visit
+
+SEARCH_PSEUDO_TOOL: TranscriptToolT = {
+    'type': 'function',
+    'function': {
+        'name': 'search',
+        'description': 'Search for available tools and commands. Results will be added to your tool list so you can call them. Use this when a user asks you to do something and you don\'t have an appropriate tool yet.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {
+                    'type': 'string',
+                    'description': 'Search query to find tools (e.g. "weather", "admin", "game")'
+                }
+            },
+            'required': ['query']
+        }
+    }
+}
+
+
+DIR_PSEUDO_TOOL: TranscriptToolT = {
+    'type': 'function',
+    'function': {
+        'name': 'dir',
+        'description': 'Look up tools by name. Use this when you know the specific name of a tool you want to load. Results will be added to your tool list.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'name': {
+                    'type': 'string',
+                    'description': 'Tool name to look up (e.g. "foo", "admin*Home*chat")'
+                }
+            },
+            'required': ['name']
+        }
+    }
+}
+
+
+async def handle_dir_tool(
+    name: str,
+    converted_tools: List[TranscriptToolT],
+    tool_lookup: Dict[str, ToolLookupInfo]
+) -> Tuple[str, List[TranscriptToolT], Dict[str, ToolLookupInfo]]:
+    """
+    Look up tools by name via /dir and merge into the existing tool list.
+    Returns (summary_text, updated_tools, updated_lookup).
+    """
+    import time as _t
+    logger.info(f">>> DIR PSEUDO-TOOL: name='{name}' — sending /dir command...")
+    t0 = _t.monotonic()
+
+    try:
+        results = await atlantis.client_command(f"/dir {name}")
+    except Exception as e:
+        elapsed = _t.monotonic() - t0
+        logger.error(f"<<< DIR FAILED after {elapsed:.2f}s: {e}")
+        return f"Dir lookup failed: {e}", converted_tools, tool_lookup
+
+    elapsed = _t.monotonic() - t0
+    logger.info(f"<<< DIR RETURNED in {elapsed:.2f}s — {len(results) if results else 0} results")
+
+    if not results:
+        return f"No tools found for '{name}'.", converted_tools, tool_lookup
+
+    new_tools, new_simple, new_lookup = convert_tools_for_llm(results)
+
+    added_names = []
+    for tool in new_tools:
+        tool_name = tool['function']['name']
+        if tool_name not in tool_lookup:
+            converted_tools.append(tool)
+            added_names.append(f"{tool_name}: {tool['function']['description']}")
+
+    for tool_name, info in new_lookup.items():
+        if tool_name not in tool_lookup:
+            tool_lookup[tool_name] = info
+
+    if added_names:
+        summary = f"Found {len(added_names)} new tool(s) added to your toolkit:\n" + "\n".join(f"- {n}" for n in added_names)
+    else:
+        summary = f"Dir lookup for '{name}' returned {len(new_tools)} tool(s), but all were already in your toolkit."
+
+    logger.info(f"Dir result: {summary}")
+    return summary, converted_tools, tool_lookup
+
+
+async def handle_search_tool(
+    query: str,
+    converted_tools: List[TranscriptToolT],
+    tool_lookup: Dict[str, ToolLookupInfo]
+) -> Tuple[str, List[TranscriptToolT], Dict[str, ToolLookupInfo]]:
+    """
+    Execute a search query and merge new tools into the existing tool list.
+    Returns (summary_text, updated_tools, updated_lookup).
+    """
+    import time as _t
+    logger.info(f">>> SEARCH PSEUDO-TOOL: query='{query}' — sending /search command...")
+    t0 = _t.monotonic()
+
+    try:
+        results = await atlantis.client_command(f"/search {query}")
+    except Exception as e:
+        elapsed = _t.monotonic() - t0
+        logger.error(f"<<< SEARCH FAILED after {elapsed:.2f}s: {e}")
+        return f"Search failed: {e}", converted_tools, tool_lookup
+
+    elapsed = _t.monotonic() - t0
+    logger.info(f"<<< SEARCH RETURNED in {elapsed:.2f}s — {len(results) if results else 0} results")
+
+    if not results:
+        return f"No tools found for '{query}'.", converted_tools, tool_lookup
+
+    new_tools, new_simple, new_lookup = convert_tools_for_llm(results)
+
+    added_names = []
+    for tool in new_tools:
+        name = tool['function']['name']
+        if name not in tool_lookup:
+            converted_tools.append(tool)
+            added_names.append(f"{name}: {tool['function']['description']}")
+
+    for name, info in new_lookup.items():
+        if name not in tool_lookup:
+            tool_lookup[name] = info
+
+    if added_names:
+        summary = f"Found {len(added_names)} new tool(s) added to your toolkit:\n" + "\n".join(f"- {n}" for n in added_names)
+    else:
+        summary = f"Search for '{query}' returned {len(new_tools)} tool(s), but all were already in your toolkit."
+
+    logger.info(f"Search result: {summary}")
+    return summary, converted_tools, tool_lookup
 
 
 def find_last_chat_entry(transcript):
-    """Find the last entry in transcript where type is 'chat'"""
+    """Find the last entry in transcript where type is 'chat', skipping thinking entries"""
     for entry in reversed(transcript):
         if entry.get('type') == 'chat':
+            who = entry.get('who', '')
+            if 'thinking' in str(who).lower():
+                continue
             return entry
     return None
 
@@ -511,6 +642,11 @@ async def fetch_transcript() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]
                 logger.info(f"       -> SKIPPED (sid=system)")
                 continue
 
+            msg_who = str(msg.get('who', ''))
+            if 'thinking' in msg_who.lower():
+                logger.info(f"       -> SKIPPED (thinking entry, who={msg_who})")
+                continue
+
             msg_content_full = msg.get('content', '')
             if not msg_content_full or not msg_content_full.strip():
                 logger.info(f"       -> SKIPPED (blank content)")
@@ -529,11 +665,6 @@ async def fetch_transcript() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]
 
             role_for_llm = 'assistant' if msg_sid == 'atlas' else 'user'
 
-            if role_for_llm == 'user':
-                created_at_str = msg.get('created_at_str', '')
-                if created_at_str:
-                    msg_content_full = f"[{created_at_str}] {msg_content_full}"
-
             transcript.append({'role': role_for_llm, 'content': [{'type': 'text', 'text': msg_content_full}]})
             logger.info(f"       -> INCLUDED as role={role_for_llm} (sid={msg_sid})")
         else:
@@ -544,65 +675,77 @@ async def fetch_transcript() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]
 
 
 
-# Session busy locks - prevents concurrent chat invocations for the same session
-_session_locks: Dict[str, asyncio.Lock] = {}
+
+# Busy session tracking — persists across dynamic reloads via SharedContainer
+_BUSY_KEY = "atlas_glm_busy_sessions"
+if not atlantis.shared.get(_BUSY_KEY):
+    atlantis.shared.set(_BUSY_KEY, {})
+_busy_sessions: Dict[str, str] = atlantis.shared.get(_BUSY_KEY)
+
 
 # no location since this is catch-all chat
 # no app since this is catch-all chat
 @chat
 async def chat():
     """Main chat function"""
-    logger.info("=== CHAT FUNCTION STARTING ===")
-    sessionId = atlantis.get_session_id()
-    logger.info(f"Session ID: {sessionId}")
+    sessionId = atlantis.get_session_id() or "unknown"
+    requestId = atlantis.get_request_id() or "unknown"
     caller: str = atlantis.get_caller()  # type: ignore[assignment]
 
-    # Per-session busy lock - if already processing, bail out
-    lock_key = f"{sessionId}"
-    if lock_key not in _session_locks:
-        _session_locks[lock_key] = asyncio.Lock()
-    lock = _session_locks[lock_key]
+    logger.info("=" * 60)
+    logger.info(f"=== CHAT TRIGGERED === session={sessionId} request={requestId} caller={caller}")
 
-    if lock.locked():
-        logger.warning(f"⚠️ Session {lock_key} is already busy - skipping chat invocation")
-        await atlantis.owner_log(f"Skipping chat - session {lock_key} already busy")
+    # Check if this session is already being handled
+    if sessionId in _busy_sessions:
+        owner_req = _busy_sessions[sessionId]
+        logger.warning(f"🔒 BUSY: session={sessionId} already owned by request={owner_req}, this request={requestId} — skipping")
+        await atlantis.owner_log(f"Skipping chat — session {sessionId} busy (owned by request {owner_req})")
         return
 
-    async with lock:
-     if True:
+    _busy_sessions[sessionId] = requestId
+    logger.info(f"🔒 ACQUIRED: session={sessionId} by request={requestId}")
+
+    try:
+        import time as _t
+
         # Fetch base prompt from server
+        logger.info(f">>> Fetching SYSTEM_PROMPT via client_command...")
+        t0 = _t.monotonic()
         await atlantis.client_command("/silent on")
-        base_prompt = await atlantis.client_command("%*SYSTEM_PROMPT")
+        base_prompt = await atlantis.client_command("@../SYSTEM_PROMPT")
         await atlantis.client_command("/silent off")
         if not base_prompt or not str(base_prompt).strip():
             logger.error("Failed to fetch SYSTEM_PROMPT, using fallback")
             base_prompt = "You are a helpful assistant."
         base_prompt = str(base_prompt)
-        logger.info(f"Base prompt loaded: {len(base_prompt)} chars")
+        logger.info(f"<<< SYSTEM_PROMPT loaded in {_t.monotonic() - t0:.2f}s ({len(base_prompt)} chars)")
 
         # Fetch and transform transcript
+        logger.info(f">>> Fetching transcript...")
+        t0 = _t.monotonic()
         rawTranscript, transcript = await fetch_transcript()
+        logger.info(f"<<< Transcript fetched in {_t.monotonic() - t0:.2f}s ({len(rawTranscript)} raw, {len(transcript)} filtered)")
 
-        # Don't respond if last chat message was from Atlas (the bot)
+        # Don't respond if last chat message was from the bot
         last_chat_entry = find_last_chat_entry(rawTranscript)
+        if last_chat_entry:
+            logger.info(f"  Last chat entry: sid={last_chat_entry.get('sid')} type={last_chat_entry.get('type')} content={str(last_chat_entry.get('content',''))[:80]}")
         if last_chat_entry and last_chat_entry.get('type') == 'chat' and last_chat_entry.get('sid') == 'atlas':
-            logger.warning("\x1b[38;5;204mLast chat entry was from atlas (bot), skipping response\x1b[0m")
-            await atlantis.owner_log(f"Skipping response - last chat was from atlas (sid={last_chat_entry.get('sid')})")
+            logger.warning(f"\x1b[38;5;204mLast chat was from atlas — skipping (session={sessionId} request={requestId})\x1b[0m")
+            await atlantis.owner_log(f"Skipping response - last chat was from atlas")
             return
 
-        # Record visit only if we're actually going to chat
-        visit_count, last_visit = record_visit(caller)
-        logger.info(f"Visitor: {caller}, visit #{visit_count}, last visit: {last_visit or 'first time'}")
-
-        await atlantis.client_command("/silent on")
-
-        # Get available tools
-        tools = await fetch_tools()
+        # Check visit info before recording, so we can detect time gaps
+        prev_count, prev_last_visit = get_visit_info(caller)
+        logger.info(f"Visitor: {caller}, visit #{prev_count}, last visit: {prev_last_visit or 'first time'}")
 
         # Fetch skills for system prompt
+        logger.info(f">>> Fetching skills...")
+        t0 = _t.monotonic()
+        await atlantis.client_command("/silent on")
         skill_texts = await fetch_skills()
-
         await atlantis.client_command("/silent off")
+        logger.info(f"<<< Skills fetched in {_t.monotonic() - t0:.2f}s ({len(skill_texts)} skills)")
 
         # Configure OpenRouter client
         logger.info("Configuring OpenRouter client...")
@@ -623,20 +766,34 @@ async def chat():
         model = "z-ai/glm-5"
         logger.info(f"Using model: {model}")
 
+        # If more than an hour since last visit (or first visit), stamp the convo start time
+        if not prev_last_visit:
+            record_new_conversation(caller)
+        else:
+            try:
+                elapsed = datetime.now() - datetime.fromisoformat(prev_last_visit)
+                if elapsed.total_seconds() > 3600:
+                    now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+                    gap_msg = f"[Some time has passed since your last interaction. The current date and time is now {now_str}.]"
+                    transcript.append({'role': 'user', 'content': [{'type': 'text', 'text': gap_msg}]})
+                    record_new_conversation(caller)
+                    logger.info(f"Injected time-gap message: {gap_msg}")
+            except (ValueError, TypeError):
+                pass
+
+        # Re-read visit info after recording so the count is up-to-date for the system prompt
+        visit_count, last_visit = get_visit_info(caller)
+
         # Build system prompt string (once, reused each turn)
         system_prompt = build_system_prompt(
             base_prompt, skill_texts,
             caller, visit_count, last_visit
         )
 
-        # Convert tools from cloud format to OpenAI format (once, before loop)
-        converted_tools, _, tool_lookup = convert_tools_for_llm(tools)
-
-        if not converted_tools:
-            logger.error("\x1b[91m" + "=" * 60 + "\x1b[0m")
-            logger.error("\x1b[91m🚨 ERROR: NO TOOLS AVAILABLE FOR LLM! 🚨\x1b[0m")
-            logger.error(f"\x1b[91mRaw tools from /search: {len(tools) if tools else 0}\x1b[0m")
-            logger.error("\x1b[91m" + "=" * 60 + "\x1b[0m")
+        # Start with only pseudo-tools — LLM discovers others dynamically
+        converted_tools: List[TranscriptToolT] = [SEARCH_PSEUDO_TOOL, DIR_PSEUDO_TOOL]
+        tool_lookup: Dict[str, ToolLookupInfo] = {}
+        logger.info("Starting with search + dir pseudo-tools only (no pre-loaded tools)")
 
         # Multi-turn conversation loop to handle tool calls
         streamTalkId = None
@@ -647,7 +804,7 @@ async def chat():
         try:
             while turn_count < max_turns:
                 turn_count += 1
-                logger.info(f"=== CONVERSATION TURN {turn_count}/{max_turns} ===")
+                logger.info(f"=== TURN {turn_count}/{max_turns} === session={sessionId} request={requestId}")
 
                 if turn_count == 1:
                     await atlantis.owner_log(f"Attempting to call OpenRouter: {model}")
@@ -662,6 +819,20 @@ async def chat():
                 logger.info(f"Tools: {len(converted_tools)} entries")
                 logger.info(f"Tool names: {[t['function']['name'] for t in converted_tools]}")
 
+                # Dump full API payload for debugging (clobbers each turn)
+                api_dump_file = os.path.join(os.path.dirname(__file__), 'api_payload.json')
+                try:
+                    with open(api_dump_file, 'w') as f:
+                        json.dump({
+                            'model': model,
+                            'messages': api_messages,
+                            'tools': converted_tools,
+                            'turn': turn_count,
+                        }, f, indent=2, default=str)
+                    logger.info(f"API payload written to {api_dump_file}")
+                except Exception as e:
+                    logger.warning(f"Failed to write API payload: {e}")
+
                 event_count = 0
                 streamed_count = 0
                 max_stream_chunks = 512
@@ -669,6 +840,8 @@ async def chat():
                 tool_call_made = False
                 accumulated_text = ""
 
+                logger.info(f">>> Calling OpenRouter ({model})...")
+                t_api = _t.monotonic()
                 stream = client.chat.completions.create(
                     model=model,
                     messages=cast(Any, api_messages),
@@ -679,7 +852,7 @@ async def chat():
                     extra_body={"reasoning": {"effort": "low"}},
                 )
 
-                logger.info("OpenRouter API call successful, starting stream...")
+                logger.info(f"<<< OpenRouter stream opened in {_t.monotonic() - t_api:.2f}s, reading chunks...")
                 if turn_count == 1:
                     await atlantis.owner_log("OpenRouter API call successful, starting stream")
 
@@ -737,7 +910,7 @@ async def chat():
                                 if tc_delta.function.arguments:
                                     tool_calls_accumulator[idx]['arguments'] += tc_delta.function.arguments
 
-                logger.info(f"Stream complete for turn {turn_count}. Events: {event_count}, text chunks: {streamed_count}, tool calls: {len(tool_calls_accumulator)}")
+                logger.info(f"Stream complete: turn={turn_count} events={event_count} text_chunks={streamed_count} tool_calls={len(tool_calls_accumulator)} session={sessionId}")
 
                 # Execute accumulated tool calls if any
                 if tool_calls_accumulator:
@@ -769,6 +942,36 @@ async def chat():
                             logger.error(f"Failed to parse tool arguments for {tool_key}: {e}")
                             arguments = {}
 
+                        # Handle dir pseudo-tool
+                        if tool_key == 'dir':
+                            name = arguments.get('name', '')
+                            logger.info(f"=== DIR TOOL CALLED: name='{name}' ===")
+                            summary, converted_tools, tool_lookup = await handle_dir_tool(
+                                name, converted_tools, tool_lookup
+                            )
+                            transcript.append({
+                                'role': 'tool',
+                                'tool_call_id': call_id,
+                                'content': summary
+                            })
+                            tool_call_made = True
+                            continue
+
+                        # Handle search pseudo-tool
+                        if tool_key == 'search':
+                            query = arguments.get('query', '')
+                            logger.info(f"=== SEARCH TOOL CALLED: query='{query}' ===")
+                            summary, converted_tools, tool_lookup = await handle_search_tool(
+                                query, converted_tools, tool_lookup
+                            )
+                            transcript.append({
+                                'role': 'tool',
+                                'tool_call_id': call_id,
+                                'content': summary
+                            })
+                            tool_call_made = True
+                            continue
+
                         if tool_key not in tool_lookup:
                             logger.error(f"\x1b[91m🚨 UNKNOWN TOOL KEY: '{tool_key}' not in tool_lookup!\x1b[0m")
                             logger.error(f"\x1b[91m  Available keys: {list(tool_lookup.keys())}\x1b[0m")
@@ -783,30 +986,33 @@ async def chat():
                         search_term = lookup_info['searchTerm']
                         function_name = lookup_info['functionName']
 
-                        logger.info(f"=== EXECUTING TOOL: {tool_key} ===")
-                        logger.info(f"  ID: {call_id}")
-                        logger.info(f"  Resolved: searchTerm='{search_term}', function='{function_name}'")
-                        logger.info(f"  Arguments: {format_json_log(arguments)}")
+                        import time as _t
+                        logger.info(f">>> EXECUTING TOOL: {tool_key} (call_id={call_id})")
+                        logger.info(f"    searchTerm='{search_term}' function='{function_name}'")
+                        logger.info(f"    args={format_json_log(arguments)}")
 
                         try:
-                            # Look up the tool's schema to coerce argument types
+                            # Look up the tool's schema from converted_tools for argument coercion
                             tool_schema = None
-                            for tool in tools:
-                                if tool.get('searchTerm') == search_term:
-                                    tool_str = tool.get('tool', '')
-                                    tool_schema = parse_tool_params(tool_str)
-                                    logger.info(f"  Found tool schema: {tool_str}")
+                            for ct in converted_tools:
+                                if ct['function']['name'] == tool_key:
+                                    tool_schema = ct['function']['parameters']
                                     break
 
                             if tool_schema and arguments:
                                 arguments = coerce_args_to_schema(arguments, tool_schema)
-                                logger.info(f"  Post-coercion arguments: {format_json_log(arguments)}")
+                                logger.info(f"    post-coercion args={format_json_log(arguments)}")
 
+                            t0 = _t.monotonic()
+                            logger.info(f"    sending /silent on...")
                             await atlantis.client_command("/silent on")
+                            logger.info(f"    sending %{search_term}...")
                             tool_result = await atlantis.client_command(f"%{search_term}", data=arguments)
+                            logger.info(f"    sending /silent off...")
                             await atlantis.client_command("/silent off")
+                            elapsed = _t.monotonic() - t0
 
-                            logger.info(f"  Tool result: {tool_result}")
+                            logger.info(f"<<< TOOL {tool_key} RETURNED in {elapsed:.2f}s — result: {str(tool_result)[:200]}")
                             await atlantis.tool_result(function_name, tool_result)
 
                             transcript.append({
@@ -817,7 +1023,7 @@ async def chat():
                             tool_call_made = True
 
                         except Exception as e:
-                            logger.error(f"Error executing tool call {tool_key}: {e}")
+                            logger.error(f"<<< TOOL {tool_key} FAILED: {e}")
                             transcript.append({
                                 'role': 'tool',
                                 'tool_call_id': call_id,
@@ -825,13 +1031,14 @@ async def chat():
                             })
 
                     logger.info("Tool calls executed, continuing conversation")
+                    logger.info(f"tool_lookup keys ({len(tool_lookup)}): {list(tool_lookup.keys())}")
 
                 # Exit if no tool calls were made
                 if not tool_call_made:
-                    logger.info("No tool call made this turn - conversation complete")
+                    logger.info(f"No tool calls — conversation complete (session={sessionId})")
                     break
                 else:
-                    logger.info("Tool call made - continuing to next turn with updated transcript")
+                    logger.info(f"Tool calls executed — continuing to turn {turn_count + 1} (session={sessionId})")
                     tool_calls_accumulator = {}
 
             # End of while loop
@@ -871,5 +1078,10 @@ async def chat():
                         pass
             raise
 
-        logger.info("=== CHAT FUNCTION COMPLETED SUCCESSFULLY ===")
-        return
+        logger.info(f"=== CHAT COMPLETED === session={sessionId} request={requestId} turns={turn_count}")
+
+    finally:
+        _busy_sessions.pop(sessionId, None)
+        logger.info(f"🔓 RELEASED: session={sessionId} request={requestId}")
+
+    return
