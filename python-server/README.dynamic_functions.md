@@ -22,7 +22,7 @@ Create Python functions that become MCP tools automatically. Put `.py` files in 
 
 ```
 dynamic_functions/
-├── chat.py              # Single function (or atlas.py)
+├── chat.py              # Single function
 ├── math_operations.py   # Multiple functions
 ├── user_management.py   # Related functions grouped
 └── OLD/                 # Automatic backups
@@ -95,7 +95,7 @@ Functions are **hidden by default** - you must use a visibility decorator to exp
 @location(name="office")
 @visible
 async def calculate(x: float, y: float):
-    """Calculate with location context."""
+    """Calculate with app and location context."""
     return x + y
 ```
 
@@ -226,22 +226,31 @@ The `atlantis` module is automatically injected into every dynamic function's ex
 **See `atlantis.py` for the full API** - the docstrings there are authoritative. Key functions include `client_log()`, `client_command()`, `stream_start/stream/stream_end()`, and various `get_*()` context accessors.
 
 
-## Shared Container
+## Shared Containers
 
-Use `atlantis.shared` for persistent memory objects (connections, not data).
+Two shared containers persist across dynamic function reloads:
+
+**`atlantis.server_shared`** — Global, server-wide. For DB connections, API clients, caches.
 
 ```python
 # Initialize database connection once
-if not atlantis.shared.get("db"):
-    atlantis.shared.set("db", sqlite3.connect("app.db"))
+if not atlantis.server_shared.get("db"):
+    atlantis.server_shared.set("db", sqlite3.connect("app.db"))
 
-db = atlantis.shared.get("db")
+db = atlantis.server_shared.get("db")
 ```
 
-**Store:** DB connections, API clients, caches
-**Don't store:** User data, application data (use databases)
+**`atlantis.session_shared`** — Auto-scoped per user session. For per-user state like tool inventories. Dynamic functions cannot access another user's session data.
 
-**Methods:** `shared.get(key)`, `shared.set(key, value)`, `shared.remove(key)`, `shared.keys()`
+```python
+# Store per-session state
+atlantis.session_shared.set("my_tools", tool_list)
+tools = atlantis.session_shared.get("my_tools")
+```
+
+**Don't store:** Application data (use databases)
+
+**Methods:** `.get(key)`, `.set(key, value)`, `.remove(key)`, `.keys()`
 
 ## Examples
 
@@ -326,19 +335,30 @@ def _clean_data(data: str):
 - Internal functions can still be called by visible functions
 
 ### Chat Function
+
+Chat bots use the `@chat` decorator to handle conversations. The bot receives the transcript and can call tools on behalf of the user.
+
+**Tool Discovery:** Rather than pre-loading all available tools (or injecting "skills" into the system prompt), the recommended pattern is to give the LLM **search and dir pseudo-tools** so it can discover tools dynamically as needed. This keeps the initial tool list small, reduces token usage, and lets the bot find exactly what it needs on the fly via `/search` and `/dir` commands.
+
 ```python
 @chat
-@visible
 async def chat():
     """Chat function that processes conversation and calls LLM."""
     # Get conversation history
-    transcript = await atlantis.client_command("\\transcript get")
+    transcript = await atlantis.client_command("/transcript get")
 
-    # Get available tools
-    tools = await atlantis.client_command("\\transcript tools")
+    # Instead of pre-loading all tools, give the LLM search + dir
+    # pseudo-tools so it can discover tools dynamically:
+    #   search — find tools by keyword (e.g. "weather", "admin")
+    #   dir    — look up tools by exact name
+    #
+    # When the LLM calls search/dir, you run the corresponding
+    # /search or /dir command and merge results into the tool list.
+    # This replaces the old "skills" approach where tool descriptions
+    # were injected into the system prompt.
 
-    # Call your LLM with transcript and tools
-    response = await call_llm(transcript, tools)
+    # See Bot/Atlas/OpenRouterGLM/main.py for a full working example
+    # with streaming, tool execution, and multi-turn conversation.
 
     # Stream response back
     stream_id = await atlantis.stream_start("chat", "ai_assistant")
@@ -346,23 +366,9 @@ async def chat():
     await atlantis.stream_end(stream_id)
 ```
 
-### Choosing a Bot Variant
-
-The `Bot/Atlas/` directory contains multiple bot variants (e.g. `Ant`, `OpenRouterAnt`, `OpenRouterGLM`). Each has its own `SYSTEM_PROMPT` function. The `game.py` file in `Home/` controls which bot is used by setting the chat path (e.g. `Bot.Atlas.OpenRouterGLM`).
-
-**Important:** Both `@visible` and `@text` decorators make functions discoverable via wildcard search (e.g. `*SYSTEM_PROMPT`). If multiple bot variants have decorated `SYSTEM_PROMPT` functions, the system will return a "Too many matching tools" error. To avoid this, **remove all decorators from `SYSTEM_PROMPT` in any bot variants you are not using**. Only the active bot's `SYSTEM_PROMPT` should have decorators.
-
-For example, if you switch from the default `OpenRouterGLM` to the `Ant` bot:
-1. Update `game.py` to point to `Bot.Atlas.Ant**chat`
-2. Remove all decorators (`@text`, `@visible`, etc.) from `SYSTEM_PROMPT` in `OpenRouterGLM/main.py` and `OpenRouterAnt/main.py`
-3. Ensure `SYSTEM_PROMPT` in `Ant/main.py` has `@text` and `@visible` so the bot can find its prompt
-
 ### Multi-user Access
 
-By default, bots are owner-only. To allow other users to connect and use your bot automatically, add `@public` to:
-- `game()` in `Home/game.py` — so connecting users trigger the game/greeting
-- `chat()` in your active bot — so users can chat with the bot
-- `SYSTEM_PROMPT()` in your active bot — so the bot can fetch its personality prompt for any user
+By default, bots are owner-only. To allow other users to connect and use your bot, add `@public` to the relevant functions (see the `@visible` vs `@public` vs `@protected` section above for details on access control decorators).
 
 ## Type Hints
 
@@ -378,7 +384,7 @@ def func(text: str, items: List[str], optional: Optional[int] = None):
 - Use `async def` for functions
 - Add type hints for parameters
 - Write clear docstrings for AI
-- Use `atlantis.shared` for connections only
+- Use `atlantis.server_shared` for connections, `atlantis.session_shared` for per-user state
 - Group related functions in same file
 - Use descriptive names
 
@@ -389,6 +395,42 @@ def func(text: str, items: List[str], optional: Optional[int] = None):
 **Context issues:** Use `await` with atlantis methods
 
 Functions automatically become MCP tools when saved to `dynamic_functions/`.
+
+## Calling Functions
+
+### Command Prefixes
+
+| Prefix | Purpose | Example |
+|--------|---------|---------|
+| `@` | Call a function (respects working path) | `@dns_check(example.com)` |
+| `%` | Call a function (absolute path, ignores working path) | `%**SEO**dns_check(example.com)` |
+| `/` | Slash command | `/dir`, `/search seo`, `/help` |
+| *(none)* | Chat message to active bot | `hello` |
+
+### Argument Passing
+
+**Use positional arguments.** Named keyword arguments are not supported — the parser will pass the parameter name as the value instead.
+
+```
+@dns_check(example.com)                ✅ Correct — positional
+@dns_check(domain="example.com")       ❌ Broken — function receives "domain" not "example.com"
+```
+
+Arguments are split on commas. Quote an argument if it contains commas and isn't the last arg:
+```
+@serp_check("flights to rome", example.com)     ✅
+@keyword_ideas(flights to rome)                  ✅ Single arg, no comma, no quotes needed
+```
+
+### Disambiguating Functions
+
+Use `**AppName**function` when the function name exists in multiple apps:
+```
+@**SEO**dns_check(example.com)        Calls dns_check in the SEO app
+@**Home**my_func()                    Calls my_func in the Home app
+```
+
+See the main [README.md](../README.md#tool-calling-with-search-terms) for the full compound name format.
 
 ---
 

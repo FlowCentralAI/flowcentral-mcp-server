@@ -4,7 +4,6 @@ import os
 
 logger = logging.getLogger("mcp_server")
 
-@public
 @game
 async def game():
     """Initializes a new chat session with Atlas as the default chat bot"""

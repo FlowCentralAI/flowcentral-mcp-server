@@ -330,15 +330,15 @@ async def fetch_skill_contents(dir_command: str) -> List[str]:
 
 
 @visible
-async def fetch_tools() -> List[Dict[str, Any]]:
-    """Fetch available tools via /search. Can be called directly for testing."""
-    logger.info("Fetching available tools...")
-    tools = await atlantis.client_command("/search system")
-    logger.info(f"Received {len(tools) if tools else 0} tools from /search")
-    logger.info("=== RAW TOOLS FROM /search ===")
-    logger.info(format_json_log(tools))
-    logger.info("=== END RAW TOOLS ===")
-    return tools
+async def show_tools() -> List[Dict[str, Any]]:
+    """Show Atlas's current tool inventory for this session."""
+    tools, lookup = get_session_tools()
+    simple: List[Dict[str, Any]] = [
+        {'name': t['function']['name'], 'description': t['function']['description']}
+        for t in tools
+    ]
+    logger.info(f"show_tools: {len(simple)} tools")
+    return simple
 
 @visible
 async def fetch_skills() -> List[str]:
@@ -347,6 +347,43 @@ async def fetch_skills() -> List[str]:
     skill_texts = await fetch_skill_contents("/dir *SKILL")
     logger.info(f"Skills loaded: {len(skill_texts)}")
     return skill_texts
+
+
+def build_visitor_context(caller: str, visit_count: int, last_visit: str) -> str:
+    """Build a visitor context note based on caller info. Returns empty string if no context applies."""
+    if not caller or visit_count <= 0:
+        return ""
+
+    hour = datetime.now().hour
+    late_night = hour >= 22 or hour < 5
+
+    if visit_count == 1:
+        if late_night:
+            visitor_note = f"This is {caller}'s first time here. It's late — their helicopter probably just arrived behind schedule, likely delayed by weather. Welcome them warmly, they've had a long trip."
+        else:
+            visitor_note = f"This is {caller}'s first time here. They're brand new — introduce yourself, welcome them warmly, and help them get oriented."
+    elif visit_count <= 5:
+        visitor_note = f"{caller} has visited {visit_count} times. They're still fairly new — be friendly and remember they might still be figuring things out."
+    else:
+        visitor_note = f"{caller} has visited {visit_count} times. They're a regular — skip the intros, be casual, and treat them like a friend."
+
+    if last_visit:
+        try:
+            elapsed = datetime.now() - datetime.fromisoformat(last_visit)
+            days = elapsed.days
+            hours = elapsed.seconds // 3600
+            if days > 30:
+                visitor_note += f" It's been about {days // 30} month(s) since their last visit — maybe acknowledge it's been a while."
+            elif days > 0:
+                visitor_note += f" It's been about {days} day(s) since their last visit."
+            elif hours > 0:
+                visitor_note += f" They were here about {hours} hour(s) ago."
+            else:
+                visitor_note += " They were just here moments ago."
+        except (ValueError, TypeError):
+            pass
+
+    return visitor_note
 
 
 def build_system_prompt(
@@ -368,42 +405,14 @@ def build_system_prompt(
     parts.append(f"Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
     # Visitor context
-    if caller and visit_count > 0:
-        hour = datetime.now().hour
-        late_night = hour >= 22 or hour < 5
-
-        if visit_count == 1:
-            if late_night:
-                visitor_note = f"This is {caller}'s first time here. It's late — their helicopter probably just arrived behind schedule, likely delayed by weather. Welcome them warmly, they've had a long trip."
-            else:
-                visitor_note = f"This is {caller}'s first time here. They're brand new — introduce yourself, welcome them warmly, and help them get oriented."
-        elif visit_count <= 5:
-            visitor_note = f"{caller} has visited {visit_count} times. They're still fairly new — be friendly and remember they might still be figuring things out."
-        else:
-            visitor_note = f"{caller} has visited {visit_count} times. They're a regular — skip the intros, be casual, and treat them like a friend."
-
-        if last_visit:
-            try:
-                elapsed = datetime.now() - datetime.fromisoformat(last_visit)
-                days = elapsed.days
-                hours = elapsed.seconds // 3600
-                if days > 30:
-                    visitor_note += f" It's been about {days // 30} month(s) since their last visit — maybe acknowledge it's been a while."
-                elif days > 0:
-                    visitor_note += f" It's been about {days} day(s) since their last visit."
-                elif hours > 0:
-                    visitor_note += f" They were here about {hours} hour(s) ago."
-                else:
-                    visitor_note += " They were just here moments ago."
-            except (ValueError, TypeError):
-                pass
-
+    visitor_note = build_visitor_context(caller, visit_count, last_visit)
+    if visitor_note:
         parts.append(visitor_note)
 
     return "\n\n".join(parts)
 
 
-VISITOR_LOG_FILE = os.path.join(os.path.dirname(__file__), '..', 'visitor_log.json')
+VISITOR_LOG_FILE = os.path.join(os.path.dirname(__file__), '..', 'visitor_data.json')
 
 import fcntl
 
@@ -676,11 +685,22 @@ async def fetch_transcript() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]
 
 
 
-# Busy session tracking — persists across dynamic reloads via SharedContainer
-_BUSY_KEY = "atlas_glm_busy_sessions"
-if not atlantis.shared.get(_BUSY_KEY):
-    atlantis.shared.set(_BUSY_KEY, {})
-_busy_sessions: Dict[str, str] = atlantis.shared.get(_BUSY_KEY)
+# Session-scoped keys — stored in session_shared (auto-scoped per user session)
+_BUSY_KEY = "atlas_busy"
+_TOOLS_KEY = "atlas_tools"
+_LOOKUP_KEY = "atlas_lookup"
+
+def get_session_tools() -> Tuple[List[TranscriptToolT], Dict[str, ToolLookupInfo]]:
+    """Get or initialize tool inventory for the current session."""
+    tools = atlantis.session_shared.get(_TOOLS_KEY)
+    lookup = atlantis.session_shared.get(_LOOKUP_KEY)
+    if tools is None:
+        tools = [SEARCH_PSEUDO_TOOL, DIR_PSEUDO_TOOL]
+        atlantis.session_shared.set(_TOOLS_KEY, tools)
+    if lookup is None:
+        lookup = {}
+        atlantis.session_shared.set(_LOOKUP_KEY, lookup)
+    return tools, lookup
 
 
 # no location since this is catch-all chat
@@ -690,32 +710,31 @@ async def chat():
     """Main chat function"""
     sessionId = atlantis.get_session_id() or "unknown"
     requestId = atlantis.get_request_id() or "unknown"
-    caller: str = atlantis.get_caller()  # type: ignore[assignment]
+    caller: str = atlantis.get_caller() or "the visitor"  # type: ignore[assignment]
 
     logger.info("=" * 60)
     logger.info(f"=== CHAT TRIGGERED === session={sessionId} request={requestId} caller={caller}")
 
     # Check if this session is already being handled
-    if sessionId in _busy_sessions:
-        owner_req = _busy_sessions[sessionId]
+    owner_req = atlantis.session_shared.get(_BUSY_KEY)
+    if owner_req:
         logger.warning(f"🔒 BUSY: session={sessionId} already owned by request={owner_req}, this request={requestId} — skipping")
         await atlantis.owner_log(f"Skipping chat — session {sessionId} busy (owned by request {owner_req})")
         return
 
-    _busy_sessions[sessionId] = requestId
+    atlantis.session_shared.set(_BUSY_KEY, requestId)
     logger.info(f"🔒 ACQUIRED: session={sessionId} by request={requestId}")
 
     try:
         import time as _t
 
-        # Fetch base prompt from server
-        logger.info(f">>> Fetching SYSTEM_PROMPT via client_command...")
+        # Load base prompt directly via import
+        logger.info(f">>> Loading SYSTEM_PROMPT via direct import...")
         t0 = _t.monotonic()
-        await atlantis.client_command("/silent on")
-        base_prompt = await atlantis.client_command("@../SYSTEM_PROMPT")
-        await atlantis.client_command("/silent off")
+        from dynamic_functions.Bot.Atlas.system_prompt import SYSTEM_PROMPT
+        base_prompt = await SYSTEM_PROMPT()
         if not base_prompt or not str(base_prompt).strip():
-            logger.error("Failed to fetch SYSTEM_PROMPT, using fallback")
+            logger.error("Failed to load SYSTEM_PROMPT, using fallback")
             base_prompt = "You are a helpful assistant."
         base_prompt = str(base_prompt)
         logger.info(f"<<< SYSTEM_PROMPT loaded in {_t.monotonic() - t0:.2f}s ({len(base_prompt)} chars)")
@@ -781,19 +800,35 @@ async def chat():
             except (ValueError, TypeError):
                 pass
 
-        # Re-read visit info after recording so the count is up-to-date for the system prompt
-        visit_count, last_visit = get_visit_info(caller)
+        # Re-read visit count after recording so it's up-to-date for the system prompt,
+        # but use the *previous* last_visit so we don't confuse "just recorded now" with
+        # "they were just here moments ago"
+        visit_count, _ = get_visit_info(caller)
 
         # Build system prompt string (once, reused each turn)
         system_prompt = build_system_prompt(
             base_prompt, skill_texts,
-            caller, visit_count, last_visit
+            caller, visit_count, prev_last_visit
         )
 
-        # Start with only pseudo-tools — LLM discovers others dynamically
-        converted_tools: List[TranscriptToolT] = [SEARCH_PSEUDO_TOOL, DIR_PSEUDO_TOOL]
-        tool_lookup: Dict[str, ToolLookupInfo] = {}
-        logger.info("Starting with search + dir pseudo-tools only (no pre-loaded tools)")
+        # Anonymous / new guest: caller not in visitor DB yet
+        if prev_count == 0:
+            # Inject directive so Atlas follows new guest procedure
+            transcript.append({'role': 'system', 'content': [{'type': 'text', 'text':
+                "[PROCEDURE REQUIRED] This is an unidentified guest. You MUST call the `new_guest` tool now to get the proper arrival procedure. Do not skip this step."
+            }]})
+            logger.info(f"Injected new guest procedure directive for caller={caller}")
+
+        # Get or initialize per-session tool inventory
+        converted_tools, tool_lookup = get_session_tools()
+        logger.info(f"Session tool inventory: {len(converted_tools)} tools, {len(tool_lookup)} in lookup")
+
+        # Pre-load new_guest tool for anonymous visitors
+        if prev_count == 0:
+            _, converted_tools, tool_lookup = await handle_dir_tool(
+                "new_guest", converted_tools, tool_lookup
+            )
+            logger.info("Pre-loaded new_guest tool for anonymous visitor")
 
         # Multi-turn conversation loop to handle tool calls
         streamTalkId = None
@@ -1081,7 +1116,7 @@ async def chat():
         logger.info(f"=== CHAT COMPLETED === session={sessionId} request={requestId} turns={turn_count}")
 
     finally:
-        _busy_sessions.pop(sessionId, None)
+        atlantis.session_shared.remove(_BUSY_KEY)
         logger.info(f"🔓 RELEASED: session={sessionId} request={requestId}")
 
     return

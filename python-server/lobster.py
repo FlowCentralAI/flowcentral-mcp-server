@@ -39,20 +39,20 @@ def get_default_lobster_tools() -> List[Tool]:
                 "required": ["commandText"],
             },
         ),
-        # Tool(
-        #     name="function",
-        #     description="Invoke a specific Atlantis function by name",
-        #     inputSchema={
-        #         "type": "object",
-        #         "properties": {
-        #             "functionName": {
-        #                 "type": "string",
-        #                 "description": 'The name of the function invoke plus any params e.g. foo(30,"chicago")',
-        #             }
-        #         },
-        #         "required": ["functionName"],
-        #     },
-        # ),
+        Tool(
+            name="chat",
+            description="Send a chat message to Atlantis. Use this for conversational messages, not commands.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The chat message to send",
+                    }
+                },
+                "required": ["message"],
+            },
+        ),
     ]
 
 
@@ -189,14 +189,40 @@ async def handle_local_lobster_tool_call(
 
     tool_args = params.get("arguments", {}) or {}
     command_data: Dict[str, Any] = {}
+    message_type = "command"
 
     if tool_name == "readme":
-        command = "@*Home*README"
+        # Read MULTIX.md directly from disk instead of routing through ~*Home**README
+        # because if multiple remotes are connected, the search term would match multiple
+        # README functions and the cloud would return an ambiguity error
+        from pathlib import Path
+        md_path = Path(__file__).parent / "dynamic_functions" / "Home" / "MULTIX.md"
+        readme_text = md_path.read_text()
+        combined_response = {"transcript": [], "returnValue": readme_text}
+        result = {
+            "content": [{"type": "text", "text": format_json_log(combined_response, colored=False)}],
+            "structuredContent": combined_response,
+        }
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result,
+        }
     elif tool_name == "command":
         command_text = tool_args.get("commandText")
         if not command_text:
             raise ValueError("Missing required argument 'commandText' for lobster tool 'command'")
+        # Ensure command has a recognized prefix; default to '/' if none present
+        if not command_text[0] in ('/', '\\', '%', '@', '~'):
+            command_text = '/' + command_text
         command = command_text
+    elif tool_name == "chat":
+        # Plain text pass-through — no prefix manipulation, sent as message_type="chat"
+        message = tool_args.get("message")
+        if not message:
+            raise ValueError("Missing required argument 'message' for lobster tool 'chat'")
+        command = message
+        message_type = "chat"
     elif tool_name == "function":
         function_target = tool_args.get("functionName")
         if not function_target:
@@ -210,6 +236,7 @@ async def handle_local_lobster_tool_call(
         request_id=lobster_request_id,
         command=command,
         command_data=command_data,
+        message_type=message_type,
         seq_num=1,
         entry_point_name=tool_name,
         local_lobster_call=True,
@@ -254,6 +281,8 @@ def apply_cloud_welcome(service_client: Any, data: Any) -> None:
     if isinstance(data, dict):
         owner_usernames = data.get("usernames", [])
         lobster_request_id = data.get("lobsterRequestId")
+        # NOTE: lobsterTools from the welcome message is logged but not used.
+        # We use hardcoded pseudo tools (readme, command) that pass through to the cloud client.
         lobster_tools_data = data.get("lobsterTools", [])
         lobster_tool_names = [t.get("name", "?") for t in lobster_tools_data] if lobster_tools_data else []
 
@@ -332,7 +361,7 @@ async def process_mcp_request(
 ) -> Dict[str, Any]:
     """Process an MCP request and return a response."""
     method = request.get("method")
-    lobster.warning(f"\033[1;91m🦞 LOBSTER PATH: {method}\033[0m")
+    lobster.debug(f"\033[1;91m🦞 LOBSTER PATH: {method}\033[0m")
 
     if "id" not in request:
         return {"error": "Missing request ID"}
@@ -484,7 +513,7 @@ async def handle_lobster_socket(
                     )
 
                 logger.debug(f"Received (for MCP processing):\n{format_json_log(request_data)}")
-                lobster.warning(f"\033[1;91m🦞 TRAP→process_mcp_request: {request_data.get('method')}\033[0m")
+                lobster.debug(f"\033[1;91m🦞 TRAP→process_mcp_request: {request_data.get('method')}\033[0m")
                 response = await process_mcp_request(
                     mcp_server,
                     request_data,

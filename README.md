@@ -5,14 +5,14 @@ Create an account at [flowcentral.ai](https://flowcentral.ai) and the bot will w
 
 Basically we have a distributed linux-style system that provides tool infra for bots. Tools are arranged in folders for easy management across functions and teams. Teams can call each other's functions directly or of course the bots can just do things themselves. Under the covers is an MCP-compliant system but we support hotloading etc. without some of the clunky overhead of constantly updating MCP tools.
 
-To get started, clone the repo, do the Python env stuff, set up your OPENROUTER API KEY (or whatever) in Home/atlas.py and connect this local Python server to the main server (see runServer). We give you all the source code to build your own tool-calling chatbot just like Claude or whichever
+To get started, clone the repo, do the Python env stuff, set up your API keys as environment variables (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, etc.) and connect this local Python server to the main server (see runServer). We give you all the source code to build your own tool-calling chatbot just like Claude or whatever. See `Bot/Atlas/` for working examples using OpenRouter and Anthropic APIs — the bot discovers tools dynamically via search/dir rather than pre-loading them.
 
-*note that Home/game.py is run whenever a new chat is created and will set the default chat tool to Home/atlas.py
+*note that Home/game.py is run whenever a new chat is created and will set the default chat tool
 
 
 ## FlowCentral Network
 
-Each MCP server is part of a collaborative network of AI agents and developers. Using the Model Context Protocol, the platform creates an ecosystem where agents can discover and use each other's capabilities across the network. Tools and functions can be shared, discovered, and coordinated between agents. The network architecture enables agents to find and leverage tools from other users, creating a decentralized ecosystem of shared capabilities.
+Each MCP server is part of a collaborative network of AI agents and developers. Using the Model Context Protocol, the platform creates an ecosystem where agents can discover and use each other's capabilities across the network. Tools and functions can be shared, discovered, and coordinated between agents—whether for enterprise automation, workflow orchestration, or any other application. The network architecture enables agents to find and leverage tools from other users, creating a decentralized ecosystem of shared capabilities.
 
 The centerpiece of this project is a Python MCP host (referred to as a 'remote') that lets you install functions and 3rd party MCP tools on the fly
 
@@ -170,8 +170,6 @@ This creates the app name: `MyApp/SubModule/Feature`
 - Group related functions together in the same folder
 - The folder structure keeps your code organized and clear
 
-**Note:** The legacy `@app(name="...")` decorator still works but is **not recommended** as it can create confusion when the decorator doesn't match the folder location. Just use folders!
-
 ### Tool Calling with Search Terms
 
 When calling tools, you can use **compound tool names** to disambiguate functions. **Only include as much of the path as needed to uniquely identify the function.**
@@ -231,4 +229,39 @@ update_image                          ✅ Works fine!
 # If Chat app ALSO has update_image:
 **ImageTools**update_image            ✅ Now we need to specify the app
 ```
+
+## Bot: Atlas
+
+Atlas is the front-desk chatbot. There are multiple backend implementations under `python-server/dynamic_functions/Bot/Atlas/`:
+
+```
+Bot/Atlas/
+├── OpenRouterGLM/main.py     # GLM model via OpenRouter (primary)
+├── OpenRouterAnt/main.py     # Anthropic model via OpenRouter
+├── Ant/main.py               # Direct Anthropic API
+├── system_prompt.py          # Shared system prompt loaded by all backends
+└── visitor_data.json         # Visitor tracking DB (JSON, file-locked)
+```
+
+### Key files
+
+- **`python-server/dynamic_functions/Home/MULTIX.md`** — User-facing documentation for the FlowCentral MCP tools (commands, search terms, tool prefixes, etc.). This is the file served by the `readme` MCP tool.
+- **`OpenRouterGLM/main.py`** — Main chat loop: fetches transcript, checks visitor data, builds the system prompt with visitor context, calls OpenRouter, handles tool calls in a multi-turn loop. Also writes `raw_transcript.json` for debugging what gets sent to the LLM.
+- **`visitor_data.json`** — Tracks per-user visit counts and last visit timestamps. Used by `get_visit_info()` (read) and `record_new_conversation()` (write). Both use `fcntl` file locking.
+- **`Tools/new_guest.py`** — Guest management tools (`new_guest`, `security_cleared`, `list_guests`, `guest_info`) that also read/write `visitor_data.json`.
+
+### Troubleshooting
+
+If MCP tools aren't working (e.g. returning `Unknown tool` errors), **check the server log first**. The Python server writes detailed logs to **`python-server/runServer.log`** — this file shows exactly what's happening with tool calls, cloud auth, and client connections. It can get large, so tail the last ~1000 lines:
+
+```bash
+tail -1000 python-server/runServer.log
+```
+
+**Common issues visible in the log:**
+- `⚠️ Unexpected tool call from local client` — the server received a tool call but didn't recognize it; check that your tools are registered
+- `❌ Authentication failed` — cloud credentials are wrong or the account doesn't exist; check your email/api-key
+- `🏠 Local MCP tool call intercepted` — confirms the server is receiving tool calls from the MCP client
+
+Visitor-related log lines include `"Visitor:"`, `"New conversation for"`, and `"Injected time-gap message"`.
 

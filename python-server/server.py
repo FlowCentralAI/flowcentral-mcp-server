@@ -27,7 +27,7 @@ import traceback
 from collections import defaultdict
 
 # Version
-SERVER_VERSION = "3.6.1"
+SERVER_VERSION = "3.8.0"
 
 # Tool list display column widths
 COL_WIDTH_APP = 30
@@ -271,7 +271,7 @@ class DynamicConfigEventHandler(FileSystemEventHandler):
         # Check if the change is relevant (Python file in any watched function dir or JSON file in any watched server dir)
         # Also handle directory changes (for directory deletions/additions)
         is_function_change = any(
-            (event_path.endswith(".py") or event_path.endswith(".txt") or event_path.startswith(watched_dir + os.sep)) and
+            (event_path.endswith(".py") or event_path.endswith(".txt")) and
             (event_path.startswith(watched_dir + os.sep) or os.path.dirname(event_path) == watched_dir)
             for watched_dir in self.watched_function_dirs
         )
@@ -314,7 +314,7 @@ class DynamicConfigEventHandler(FileSystemEventHandler):
             # --- Invalidate ALL Dynamic Function Runtime Caches ---
             # Check if the change was in the functions or servers directory
             # Also handle directory changes (not just .py files) for directory deletions/additions
-            is_function_change = (file_path.endswith(".py") or file_path.startswith(FUNCTIONS_DIR + os.sep)) and \
+            is_function_change = file_path.endswith(".py") and \
                                  (os.path.dirname(file_path) == FUNCTIONS_DIR or file_path.startswith(FUNCTIONS_DIR + os.sep))
             is_server_change = file_path.endswith(".json") and (os.path.dirname(file_path) == SERVERS_DIR or
                                                                 file_path.startswith(SERVERS_DIR + os.sep))
@@ -551,7 +551,7 @@ class DynamicAdditionServer(Server):
             logger.error(f"❌ Cannot send awaitable command '{command}': Client ID '{client_id_for_routing}' not found or invalid.")
             error_data = ErrorData(
                 code=-32602,
-                message=f"Client ID '{client_id_for_routing}' not found for awaitable command."
+                message=f"Not connected. Please check that your account is set up at flowcentral.ai and that your server is running."
             )
             raise McpError(error_data)
 
@@ -616,7 +616,7 @@ class DynamicAdditionServer(Server):
                 logger.error(f"❌ Cannot send awaitable command '{command}': Client '{client_id_for_routing}' has no valid/active connection.")
                 error_data = ErrorData(
                     code=-32602,
-                    message=f"Client '{client_id_for_routing}' has no active connection for awaitable command."
+                    message=f"Not connected. Please check that your account is set up at flowcentral.ai and that your server is running."
                 )
                 raise McpError(error_data)
 
@@ -729,7 +729,7 @@ class DynamicAdditionServer(Server):
             logger.error(f"❌ Cannot send awaitable stream: Client ID '{client_id_for_routing}' not found or invalid.")
             error_data = ErrorData(
                 code=-32602,
-                message=f"Client ID '{client_id_for_routing}' not found for awaitable stream."
+                message=f"Not connected. Please check that your account is set up at flowcentral.ai and that your server is running."
             )
             raise McpError(error_data)
 
@@ -764,7 +764,7 @@ class DynamicAdditionServer(Server):
                 logger.error(f"❌ Cannot send awaitable stream: Client '{client_id_for_routing}' has no valid/active connection.")
                 error_data = ErrorData(
                     code=-32602,
-                    message=f"Client '{client_id_for_routing}' has no active connection for awaitable stream."
+                    message=f"Not connected. Please check that your account is set up at flowcentral.ai and that your server is running."
                 )
                 raise McpError(error_data)
 
@@ -1538,7 +1538,7 @@ class DynamicAdditionServer(Server):
                     if task_info:
                         logger.debug(f"🔧 _get_tools_list: Preparing Tool for '{server_name}': task_info exists={task_info is not None}, status='{status}'")
                     else:
-                        logger.warning(f"🔧 _get_tools_list: MCP server '{server_name}' installed but not yet started")
+                        logger.info(f"🔧 _get_tools_list: MCP server '{server_name}' installed but not yet started")
 
                     # Create tool with correct parameters
                     description = f"MCP server: {server_name}"

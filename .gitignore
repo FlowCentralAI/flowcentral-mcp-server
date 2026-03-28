@@ -49,13 +49,17 @@ python-server/dynamic_functions/OLD/
 python-server/dynamic_functions/*
 !python-server/dynamic_functions/Home
 !python-server/dynamic_functions/Bot
+!python-server/dynamic_functions/Tools
 python-server/dynamic_servers/*
 python-server/dynamic_functions/.gitignore
 python-server/dynamic_servers/OLD/
 !python-server/dynamic_servers/weather.json
 python-server/runServerProd
 python-server/runServerFoo*
+python-server/runServerAdmin*
 python-server/runServerBar*
+python-server/runServer*Local
+python-server/runServer*Prod
 
 
 python-server2/
@@ -67,8 +71,14 @@ log/
 server.log
 
 python-server/set_OPENROUTER.bat
+python-server/set_ANTHROPIC.bat
 
 runServer.log
-
-visitor_log.json
 python-server/tools_response_debug.json
+python-server/dynamic_functions.TEST/*
+
+# Bot Atlas runtime files (all variants)
+python-server/dynamic_functions/Bot/Atlas/visitor_data.json
+python-server/dynamic_functions/Bot/Atlas/*/api_payload.json
+python-server/dynamic_functions/Bot/Atlas/*/raw_transcript.json
+python-server/dynamic_functions/Bot/Atlas/*/visitor_log.json
