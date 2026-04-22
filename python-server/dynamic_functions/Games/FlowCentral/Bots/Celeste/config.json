@@ -1,0 +1,12 @@
+{
+  "sid": "celeste",
+  "displayName": "Celeste",
+  "image": "celeste_face.jpg",
+  "provider": "openrouter",
+  "model": "minimax/minimax-m2.7",
+  "baseUrl": "https://openrouter.ai/api/v1",
+  "apiKeyEnv": "OPENROUTER_API_KEY",
+  "chatHandler": "dynamic_functions.Home.chat.handle_chat_completions",
+  "systemPrompt": "system_prompt.md",
+  "greeting": "Good day. I'm Celeste. May I get you something while you settle in?"
+}

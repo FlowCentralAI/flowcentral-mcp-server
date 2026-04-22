@@ -43,7 +43,7 @@ import utils  # Utility module for dynamic functions
 PARENT_PACKAGE_NAME = "dynamic_functions"
 
 # Visibility decorators that allow remote function calls
-VISIBILITY_DECORATORS = ['visible', 'public', 'protected', 'tick', 'chat', 'text', 'session', 'game', 'index', 'price', 'location', 'app', 'copy']
+VISIBILITY_DECORATORS = ['visible', 'public', 'protected', 'tick', 'chat', 'text', 'session', 'game', 'index', 'price', 'location', 'app', 'copy', 'dynamic']
 
 # --- Identity Decorator Definition ---
 def _mcp_identity_decorator(f):
@@ -215,6 +215,18 @@ def price(pricePerCall: float, pricePerSec: float):
 
     return decorator
 
+# --- Dynamic Decorator Definition ---
+def dynamic(func):
+    """
+    Decorator that marks a function as 'dynamic'.
+
+    Usage: @dynamic
+           def my_dynamic_function():
+               ...
+    """
+    setattr(func, '_is_dynamic', True)
+    return func
+
 # --- Copy Decorator Definition ---
 def copy(func):
     """
@@ -237,8 +249,41 @@ def copy(func):
     setattr(func, '_is_copyable', True)
     return func
 
+# --- Exclude Decorator Definition ---
+def exclude(func):
+    """
+    Decorator that marks a function as excluded from the tool list sent to the cloud.
+    Does nothing at runtime — purely a marker that appears in the function's
+    decorator annotations so the cloud can filter it out.
+
+    Usage: @exclude
+           def my_excluded_function():
+               ...
+    """
+    setattr(func, '_is_excluded', True)
+    return func
+
 class DynamicFunctionManager:
     def __init__(self, functions_dir):
+        # Install decorator identities into builtins so they're available to any module
+        # loaded via regular Python imports (e.g. Bot modules importing from Tools)
+        import builtins
+        builtins.visible = visible
+        builtins.chat = _mcp_identity_decorator
+        builtins.text = text
+        builtins.public = _mcp_identity_decorator
+        builtins.session = _mcp_identity_decorator
+        builtins.game = _mcp_identity_decorator
+        builtins.app = app
+        builtins.location = location
+        builtins.tick = tick
+        builtins.protected = protected
+        builtins.index = index
+        builtins.price = price
+        builtins.copy = copy
+        builtins.dynamic = dynamic
+        builtins.exclude = exclude
+
         # State that was previously global
         self.functions_dir = functions_dir
         self._runtime_errors = {}
@@ -290,6 +335,36 @@ class DynamicFunctionManager:
             return None
         # Convert path separators to dots
         return app_path.replace(os.sep, '.')
+
+    @staticmethod
+    def _directory_has_visible_index(dir_path: str) -> bool:
+        """
+        A directory is visible only when its main.py defines an index() function
+        decorated with one of the visibility decorators.
+        """
+        main_py = os.path.join(dir_path, 'main.py')
+        if not os.path.isfile(main_py):
+            return False
+
+        try:
+            with open(main_py, 'r', encoding='utf-8') as f:
+                code = f.read()
+            tree = ast.parse(code)
+        except Exception as e:
+            logger.warning(f"⚠️ Error checking visibility of {main_py}: {e}")
+            return False
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == 'index':
+                decorators = [
+                    (d.id if isinstance(d, ast.Name) else
+                     d.attr if isinstance(d, ast.Attribute) else
+                     d.func.id if isinstance(d, ast.Call) and isinstance(d.func, ast.Name) else None)
+                    for d in node.decorator_list
+                ]
+                return any(dec in VISIBILITY_DECORATORS for dec in decorators if dec)
+
+        return False
 
     # File operations
     async def _fs_add_code(self, name: str, code: str, app: Optional[str] = None) -> str:
@@ -783,6 +858,7 @@ class DynamicFunctionManager:
                     protection_name_from_decorator = None # Initialize protection_name
                     is_index_from_decorator = False # Initialize is_index
                     is_copyable_from_decorator = False # Initialize is_copyable
+                    is_dynamic_from_decorator = False # Initialize is_dynamic
                     price_per_call_from_decorator = None # Initialize price_per_call
                     price_per_sec_from_decorator = None # Initialize price_per_sec
                     if func_def_node.decorator_list:
@@ -796,6 +872,9 @@ class DynamicFunctionManager:
                                 # Check if it's the @copy decorator
                                 if decorator_name == 'copy':
                                     is_copyable_from_decorator = True
+                                # Check if it's the @dynamic decorator
+                                if decorator_name == 'dynamic':
+                                    is_dynamic_from_decorator = True
                             elif isinstance(decorator_node, ast.Call): # e.g. @app(name="foo") or @app("foo"), @location(name="bar") or @location("bar")
                                 if isinstance(decorator_node.func, ast.Name):
                                     decorator_func_name = decorator_node.func.id
@@ -931,7 +1010,8 @@ class DynamicFunctionManager:
                         "is_copyable": is_copyable_from_decorator, # Add extracted is_copyable flag
                         "price_per_call": price_per_call_from_decorator, # Add extracted price_per_call
                         "price_per_sec": price_per_sec_from_decorator, # Add extracted price_per_sec
-                        "text_content_type": text_content_type_from_decorator # Add extracted text content type (e.g. "markdown")
+                        "text_content_type": text_content_type_from_decorator, # Add extracted text content type (e.g. "markdown")
+                        "is_dynamic": is_dynamic_from_decorator # Add extracted is_dynamic flag
                     }
                     functions_info.append(function_info)
 
@@ -1032,7 +1112,11 @@ async def {name}():
                 for dir_name in dirs:
                     if dir_name in ignore_dirs or dir_name.startswith('.'):
                         dirs_to_remove.append(dir_name)
-                        #logger.debug(f"🚫 Skipping directory: {os.path.join(root, dir_name)}")
+                    # Hidden folder check applies at every level. Pruning here also hides all descendants.
+                    elif not self._directory_has_visible_index(os.path.join(root, dir_name)):
+                        dirs_to_remove.append(dir_name)
+                        dir_rel_path = os.path.relpath(os.path.join(root, dir_name), self.functions_dir)
+                        logger.info(f"🙈 Hidden folder (no visible index): {dir_rel_path}")
 
                 for dir_name in dirs_to_remove:
                     dirs.remove(dir_name)
@@ -1603,6 +1687,41 @@ async def {name}():
         else:
             return f"Function '{secure_source_name}' moved from '{source_display}' to '{dest_app}'"
 
+    async def folder_rename(self, source_app: str, dest_app: str) -> str:
+        '''
+        Renames an app folder (directory) within dynamic_functions.
+
+        Args:
+            source_app: The current app/folder name (e.g. "Game")
+            dest_app: The new app/folder name (e.g. "Callback")
+
+        Returns:
+            Success message string
+
+        Raises:
+            ValueError: If source doesn't exist or destination already exists
+            IOError: If rename fails
+        '''
+        source_path = os.path.join(self.functions_dir, source_app)
+        dest_path = os.path.join(self.functions_dir, dest_app)
+
+        if not os.path.isdir(source_path):
+            raise ValueError(f"Source app folder '{source_app}' does not exist")
+
+        if os.path.exists(dest_path):
+            raise ValueError(f"Destination app folder '{dest_app}' already exists")
+
+        try:
+            os.rename(source_path, dest_path)
+            logger.info(f"Renamed app folder '{source_app}' to '{dest_app}'")
+        except OSError as e:
+            raise IOError(f"Failed to rename folder '{source_app}' to '{dest_app}': {e}")
+
+        # Rebuild mapping to reflect the new folder name
+        await self._build_function_file_mapping()
+
+        return f"App folder '{source_app}' renamed to '{dest_app}'"
+
     async def _write_error_log(self, name: str, error_message: str) -> None: # Made it async to match caller, added self
         '''
         Write an error message to a function-specific log file in the dynamic_functions folder.
@@ -1787,6 +1906,7 @@ async def {name}():
                     entry_point_name=actual_function_name,
                     user=user,
                     session_id=kwargs.get("session_id"),
+                    game_id=kwargs.get("game_id"),
                     command_seq=kwargs.get("command_seq"),
                     shell_path=kwargs.get("shell_path")
                 )
@@ -1985,6 +2105,8 @@ async def {name}():
 
             # Extract session_id from kwargs if present
             session_id = kwargs.get('session_id', None)
+            # Extract game_id from kwargs if present (a game may span multiple sessions)
+            game_id = kwargs.get('game_id', None)
             # Extract command_seq from kwargs if present
             command_seq = kwargs.get('command_seq', None)
 
@@ -1997,6 +2119,7 @@ async def {name}():
                 client_id=client_id,
                 user=user,  # Pass the user who made the call - only works if atlantis.py has been updated
                 session_id=session_id,  # Pass the session_id
+                game_id=game_id,  # Pass the game_id (game may span multiple sessions)
                 command_seq=command_seq,  # Pass the command_seq
                 shell_path=shell_path,  # Pass the shell_path
                 entry_point_name=actual_function_name # Pass the actual function name (not filename)

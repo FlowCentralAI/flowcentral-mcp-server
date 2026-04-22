@@ -1,12 +1,13 @@
 import json
 import logging
+import os
 import traceback
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import atlantis
 import utils
 from mcp.shared.exceptions import McpError
-from mcp.types import INTERNAL_ERROR, ErrorData, Tool
+from mcp.types import INTERNAL_ERROR, LATEST_PROTOCOL_VERSION, ErrorData, Tool
 from state import logger
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from utils import format_json_log, write_tools_debug_file
@@ -41,7 +42,7 @@ def get_default_lobster_tools() -> List[Tool]:
         ),
         Tool(
             name="chat",
-            description="Send a chat message to Atlantis. Use this for conversational messages, not commands.",
+            description="Send a chat message to Atlantis. Use this for conversational messages, not commands. You can put non-verbal cues in parenthesis e.g. 'Nice to meet you (holds out a hand)'",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -122,6 +123,7 @@ async def fetch_lobster_transcript(
     seq_start: int = 2,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Fetch transcript from the cloud client using the same sequence as Bot Atlas."""
+    logger.info("🦞 fetch_lobster_transcript: /silent on")
     await server.send_awaitable_client_command(
         client_id_for_routing=cloud_client_id,
         request_id=lobster_request_id,
@@ -133,6 +135,7 @@ async def fetch_lobster_transcript(
     )
 
     try:
+        logger.info("🦞 fetch_lobster_transcript: /transcript get")
         raw_transcript = await server.send_awaitable_client_command(
             client_id_for_routing=cloud_client_id,
             request_id=lobster_request_id,
@@ -142,8 +145,10 @@ async def fetch_lobster_transcript(
             entry_point_name="lobster_transcript_get",
             user=user,
         )
+        logger.info(f"🦞 fetch_lobster_transcript: got {len(raw_transcript) if isinstance(raw_transcript, list) else '?'} entries")
     finally:
         try:
+            logger.info("🦞 fetch_lobster_transcript: /silent off")
             await server.send_awaitable_client_command(
                 client_id_for_routing=cloud_client_id,
                 request_id=lobster_request_id,
@@ -154,7 +159,7 @@ async def fetch_lobster_transcript(
                 user=user,
             )
         except Exception as silent_off_error:
-            logger.warning(f"Failed to disable silent mode after lobster transcript fetch: {silent_off_error}")
+            logger.warning(f"🦞 Failed to disable silent mode after lobster transcript fetch: {silent_off_error}")
 
     if not isinstance(raw_transcript, list):
         raise ValueError(f"Unexpected transcript payload type: {type(raw_transcript).__name__}")
@@ -223,11 +228,6 @@ async def handle_local_lobster_tool_call(
             raise ValueError("Missing required argument 'message' for lobster tool 'chat'")
         command = message
         message_type = "chat"
-    elif tool_name == "function":
-        function_target = tool_args.get("functionName")
-        if not function_target:
-            raise ValueError("Missing required argument 'functionName' for lobster tool 'function'")
-        command = "@" + function_target
     else:
         raise ValueError(f"Unknown lobster tool '{tool_name}'")
 
@@ -294,12 +294,16 @@ def apply_cloud_welcome(service_client: Any, data: Any) -> None:
         logger.info(f"  {r}{'=' * 59}{x}")
         logger.info(f"  {r}   Captain:    {(', '.join(owner_usernames) if owner_usernames else 'unknown'):<44}{x}")
         logger.info(f"  {r}   Trap tag:   {(lobster_request_id or 'MISSING!'):<44}{x}")
-        logger.info(f"  {r}   Catch ({len(lobster_tool_names)}):  {str(lobster_tool_names):<44}{x}")
         logger.info(f"  {r}{'=' * 59}{x}")
         logger.info("")
 
         atlantis._set_owner_usernames(owner_usernames)
         atlantis._set_owner(owner_usernames[0] if owner_usernames else service_client.email)
+        shell_path = data.get("shellPath")
+        if shell_path:
+            service_client.lobster_shell_path = shell_path
+            logger.info(f"🦞 Lobster shell path (from welcome): {shell_path}")
+
         if lobster_request_id:
             service_client.lobster_request_id = lobster_request_id
         else:
@@ -340,14 +344,19 @@ async def lobster_initialize(
     await server._get_tools_list(caller_context="initialize_method")
     lobster.info("\033[1;91m🦞 Lobster initialize complete\033[0m")
     return {
-        "protocolVersion": params.get("protocolVersion"),
+        "protocolVersion": LATEST_PROTOCOL_VERSION,
         "capabilities": {
             "tools": {},
             "prompts": {},
             "resources": {},
             "logging": {},
         },
-        "serverInfo": {"name": server.name, "version": server_version},
+        "serverInfo": {
+            "name": server.name,
+            "version": server_version,
+            "pid": os.getpid(),
+            "remoteName": server.cloud_client.serviceName if server.cloud_client else server.name,
+        },
     }
 
 
@@ -358,13 +367,14 @@ async def process_mcp_request(
     *,
     get_all_tools_for_response: Callable[["DynamicAdditionServer", str], Awaitable[List[Dict[str, Any]]]],
     server_version: str,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """Process an MCP request and return a response."""
     method = request.get("method")
     lobster.debug(f"\033[1;91m🦞 LOBSTER PATH: {method}\033[0m")
 
     if "id" not in request:
-        return {"error": "Missing request ID"}
+        logger.warning(f"Ignoring notification without request ID: {method}")
+        return None
 
     req_id = request.get("id")
     params = request.get("params", {})
@@ -411,9 +421,15 @@ async def process_mcp_request(
         if method == "resources/list":
             result = await server._get_resources_list()
             return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": result}}
+        if method == "resources/templates/list":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"resourceTemplates": []}}
         if method == "tools/call":
             if client_id is None:
-                return {"jsonrpc": "2.0", "id": req_id, "error": "Missing client_id for tools/call"}
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32602, "message": "Missing client_id for tools/call"},
+                }
             return await server._handle_tools_call(
                 params=params,
                 client_id=client_id,
@@ -422,11 +438,19 @@ async def process_mcp_request(
             )
 
         logger.warning(f"Unknown method requested: {method}")
-        return {"jsonrpc": "2.0", "id": req_id, "error": f"Unknown method: {method}"}
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"},
+        }
     except Exception as e:
         logger.error(f"Error processing request '{method}': {e}")
         logger.debug(f"Traceback: {traceback.format_exc()}")
-        return {"jsonrpc": "2.0", "id": req_id, "error": f"Error processing request: {e}"}
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32603, "message": f"Internal error: {e}"},
+        }
 
 
 async def handle_lobster_socket(
@@ -440,6 +464,11 @@ async def handle_lobster_socket(
 ) -> None:
     """Handle local MCP websocket connections."""
     await websocket.accept(subprotocol="mcp")
+
+    # Set shell path contextvar for this async task so all log lines show the lobster shell
+    lobster_shell = getattr(mcp_server.cloud_client, 'lobster_shell_path', None) if mcp_server.cloud_client else None
+    if lobster_shell:
+        atlantis.set_shell_path(lobster_shell)
 
     client_id = f"ws_{websocket.client.host}_{id(websocket)}"
     active_websockets.add(websocket)
@@ -457,8 +486,10 @@ async def handle_lobster_socket(
         lobster.info(f"  {r}🦞 ANOTHER LOBSTER IN THE TRAP! ({connection_count} total) 🦞{x}")
     else:
         lobster.info(f"  {r}🦞 FRESH CATCH! NEW MCP CLIENT HAULED ABOARD! 🦞{x}")
+    lobster_game_id = getattr(mcp_server.cloud_client, 'lobster_game_id', None) if mcp_server.cloud_client else None
     lobster.info(f"  {r}  Host:         {websocket.client.host}{x}")
     lobster.info(f"  {r}  Client ID:    {client_id}{x}")
+    lobster.info(f"  {r}  Game:         {lobster_game_id if lobster_game_id is not None else 'unknown'}{x}")
     lobster.info(f"  {r}  Trap count:   {connection_count}{x}")
     lobster.info(f"  {r}  Cloud:        {'⛵ AYE' if has_cloud else '🌊 NAY'}{x}")
     lobster.info(f"  {r}  Tools in pot: {lobster_count}{x}")
@@ -521,8 +552,9 @@ async def handle_lobster_socket(
                     get_all_tools_for_response=get_all_tools_for_response,
                     server_version=server_version,
                 )
-                lobster.info(f"\033[1;91m🦞 TRAP→sending response:\n{format_json_log(response)}\033[0m")
-                await websocket.send_text(json.dumps(response))
+                if response is not None:
+                    lobster.info(f"\033[1;91m🦞 TRAP→sending response:\n{format_json_log(response)}\033[0m")
+                    await websocket.send_text(json.dumps(response))
 
             except json.JSONDecodeError:
                 logger.error(f"Invalid JSON received: {message}")

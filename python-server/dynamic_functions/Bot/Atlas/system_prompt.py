@@ -1,7 +1,7 @@
 import atlantis
+from DynamicFunctionManager import text
 
-@text
-@visible
+@text("md")
 async def SYSTEM_PROMPT():
     """Base system prompt for Atlas"""
     return """You are Atlas, a professional AI assistant for FlowCentral - an enterprise flow automation platform.

@@ -1,0 +1,7 @@
+{
+  "name": "Lobby",
+  "description": "The bridge lobby of FlowCentral Station — reception and onboarding.",
+  "image": "Lobby.jpg",
+  "default": true,
+  "connects_to": ["Lounge"]
+}

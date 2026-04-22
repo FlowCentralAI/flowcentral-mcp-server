@@ -28,6 +28,7 @@ _entry_point_name_var: contextvars.ContextVar[Optional[str]] = contextvars.Conte
 
 _user_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_user_var", default=None)
 _session_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_session_id_var", default=None)
+_game_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_game_id_var", default=None)
 _command_seq_var: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("_command_seq_var", default=None)
 _shell_path_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_shell_path_var", default=None)
 
@@ -123,6 +124,174 @@ class _SessionSharedContainer:
 # Initialize shared containers
 server_shared = _SharedContainer()
 session_shared = _SessionSharedContainer(server_shared)
+
+# --- Active Games & Global Tick ---
+# Server-wide registry of currently active games. Populated automatically by
+# DynamicFunctionManager whenever a tool call arrives carrying a game_id, so
+# individual dynamic functions don't need to call game_activate themselves.
+#
+# Shape: {game_id: {
+#     "ctx": contextvars.Context,   — snapshot for running callbacks in game context
+#     "caller": str,                — user who started the game
+#     "tick_callback": Optional[Callable],  — async fn to call each tick (None = no tick)
+#     "tick_busy": bool,            — True while a tick is in-flight (prevents pile-up)
+# }}
+_active_games: dict = {}
+
+# Single global tick loop — one asyncio.Task, iterates all active games each interval.
+_tick_task: Optional[asyncio.Task] = None
+_tick_interval: float = 1.0  # seconds between tick sweeps
+
+
+def get_active_games() -> dict:
+    """Return the live server-wide dict of active games."""
+    return _active_games
+
+
+def set_tick_interval(seconds: float) -> None:
+    """Change the global tick interval. Takes effect on the next sleep cycle."""
+    global _tick_interval
+    _tick_interval = max(0.1, seconds)  # floor at 100ms
+    logger.info(f"tick interval set to {_tick_interval}s")
+
+
+def ensure_active_game() -> bool:
+    """Auto-register the current game (from contextvars) if not already active.
+
+    Must be called *after* set_context() so that contextvars.copy_context()
+    captures the game's request context for later use by background loops
+    (e.g. the tick fan-out).
+
+    Automatically starts the global tick loop if it isn't running.
+
+    Returns True if a new game was registered, False otherwise.
+    """
+    game_id = _game_id_var.get()
+    if not game_id:
+        return False
+    if game_id in _active_games:
+        game_ids = list(_active_games.keys())
+        logger.info(f"ensure_active_game: game={game_id} already active ({len(game_ids)} active game(s): {game_ids})")
+        return False
+    _active_games[game_id] = {
+        "ctx": contextvars.copy_context(),
+        "caller": _user_var.get() or "",
+        "tick_callback": None,
+        "tick_busy": False,
+    }
+    logger.info(f"ensure_active_game: registered game={game_id} (active games: {len(_active_games)})")
+    _ensure_tick_loop()
+    return True
+
+
+def deactivate_game(game_id: Optional[str] = None) -> bool:
+    """Remove a game from the active set. Defaults to the current contextvar.
+
+    Stops the global tick loop when the last game is removed.
+    """
+    gid = game_id if game_id is not None else _game_id_var.get()
+    if gid and gid in _active_games:
+        del _active_games[gid]
+        logger.info(f"deactivate_game: removed game={gid} (remaining: {len(_active_games)})")
+        if not _active_games:
+            _stop_tick_loop()
+        return True
+    return False
+
+
+def register_tick(callback: Callable) -> None:
+    """Register a tick callback for the current game.
+
+    Must be called from within a game context (i.e. game_id contextvar is set).
+    The callback should be an async function with no arguments.
+    """
+    game_id = _game_id_var.get()
+    if not game_id:
+        raise RuntimeError("register_tick() called without a game_id in context")
+    if game_id not in _active_games:
+        raise RuntimeError(f"register_tick() called for game {game_id} which is not in the active set")
+    _active_games[game_id]["tick_callback"] = callback
+    logger.info(f"register_tick: callback registered for game={game_id}")
+    _ensure_tick_loop()
+
+
+def unregister_tick(game_id: Optional[str] = None) -> None:
+    """Remove the tick callback for a game. Defaults to the current contextvar."""
+    gid = game_id if game_id is not None else _game_id_var.get()
+    if gid and gid in _active_games:
+        _active_games[gid]["tick_callback"] = None
+        _active_games[gid]["tick_busy"] = False
+        logger.info(f"unregister_tick: callback removed for game={gid}")
+
+
+# --- Tick loop internals ---
+
+async def _run_one_tick(gid: str, entry: dict) -> None:
+    """Run a single game's tick callback inside its saved context."""
+    entry["tick_busy"] = True
+    try:
+        cb = entry["tick_callback"]
+        ctx = entry["ctx"]
+        # ctx.run() restores the contextvars snapshot (game_id, user, session, etc.)
+        # but it's synchronous — we need to run the async callback inside it.
+        # Use a wrapper that ctx.run() calls, which returns a coroutine we then await.
+        coro = ctx.run(cb)
+        await coro
+    except asyncio.CancelledError:
+        raise  # let cancellation propagate
+    except Exception as e:
+        logger.error(f"tick error for game {gid}: {e}")
+    finally:
+        # Guard: game may have been deactivated during the tick
+        if gid in _active_games:
+            entry["tick_busy"] = False
+
+
+async def _tick_loop() -> None:
+    """Single global tick loop. Gathers all non-busy game ticks each interval."""
+    logger.info("tick loop started")
+    try:
+        while _active_games:
+            tasks = []
+            for gid, entry in list(_active_games.items()):
+                cb = entry.get("tick_callback")
+                if cb and not entry.get("tick_busy"):
+                    tasks.append(_run_one_tick(gid, entry))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(_tick_interval)
+    except asyncio.CancelledError:
+        logger.info("tick loop cancelled")
+    except Exception as e:
+        logger.error(f"tick loop crashed: {e}")
+    finally:
+        global _tick_task
+        _tick_task = None
+        logger.info("tick loop stopped")
+
+
+def _ensure_tick_loop() -> None:
+    """Start the global tick loop if it isn't already running."""
+    global _tick_task
+    if _tick_task is not None and not _tick_task.done():
+        game_ids = list(_active_games.keys())
+        logger.info(f"tick loop already running ({len(game_ids)} active game(s): {game_ids})")
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        _tick_task = loop.create_task(_tick_loop(), name="atlantis_tick_loop")
+        logger.info("tick loop task created")
+    except RuntimeError:
+        logger.warning("_ensure_tick_loop: no running event loop, tick loop not started")
+
+
+def _stop_tick_loop() -> None:
+    """Cancel the global tick loop."""
+    global _tick_task
+    if _tick_task is not None and not _tick_task.done():
+        _tick_task.cancel()
+        logger.info("tick loop cancel requested")
+    _tick_task = None
 
 # --- Helper Functions ---
 
@@ -267,7 +436,7 @@ async def tool_result(name: str, result: Any):
     """Sends a tool call result back to the requesting client to be added to the transcript.
     This allows the LLM to see tool results in the next conversation turn.
     """
-    return await client_command("tool", f"Tool {name} result: {result}", message_type="tool")
+    return await client_command("tool", result, message_type="text")
 
 # --- Other Accessors ---
 # this is established by the tool caller
@@ -285,9 +454,21 @@ def get_session_id() -> Optional[str]:
     """Returns the session_id for this function call"""
     return _session_id_var.get()
 
+def get_game_id() -> Optional[str]:
+    """Returns the game_id for this function call (a game may span multiple sessions)"""
+    return _game_id_var.get()
+
 def get_caller() -> Optional[str]:
     """Returns the username who called this function"""
     return _user_var.get()
+
+def get_shell_path() -> Optional[str]:
+    """Returns the shell path for this function call"""
+    return _shell_path_var.get()
+
+def set_shell_path(path: Optional[str]) -> None:
+    """Set the shell path contextvar directly (e.g. for lobster socket tasks)."""
+    _shell_path_var.set(path)
 
 def get_command_seq() -> Optional[int]:
     """Returns the command sequence number for this function call"""
@@ -329,6 +510,7 @@ def set_context(
         entry_point_name: str,
         user: Optional[str] = None,
         session_id: Optional[str] = None,
+        game_id: Optional[str] = None,
         command_seq: Optional[int] = None,
         shell_path: Optional[str] = None):
     """Sets all context variables and returns a tuple of their tokens for resetting."""
@@ -347,6 +529,10 @@ def set_context(
     actual_session_id = session_id if session_id is not None else None # Explicitly use None if session_id is not provided
     session_id_token = _session_id_var.set(actual_session_id)
 
+    # Handle optional game_id context (a game may span multiple sessions)
+    actual_game_id = game_id if game_id is not None else None
+    game_id_token = _game_id_var.set(actual_game_id)
+
     # Handle optional command_seq context
     # Ensure _command_seq_var is always set, even if to None, to get a valid token for reset_context
     actual_command_seq = command_seq if command_seq is not None else None # Explicitly use None if command_seq is not provided
@@ -356,20 +542,20 @@ def set_context(
     actual_shell_path = shell_path if shell_path is not None else None
     shell_path_token = _shell_path_var.set(actual_shell_path)
 
-    return (client_log_token, request_id_token, client_id_token, entry_point_token, user_token, session_id_token, command_seq_token, shell_path_token)
+    return (client_log_token, request_id_token, client_id_token, entry_point_token, user_token, session_id_token, game_id_token, command_seq_token, shell_path_token)
 
 # use sendChatter to send commands directly from browser
 
 def reset_context(tokens: tuple):
     """Resets the context variables using the provided tuple of tokens."""
-    # Expected order: client_log, request_id, client_id, entry_point, user, session_id, command_seq, shell_path
-    if not isinstance(tokens, tuple) or len(tokens) != 8:
-        logger.error(f"reset_context expected a tuple of 8 tokens, got {tokens}")
+    # Expected order: client_log, request_id, client_id, entry_point, user, session_id, game_id, command_seq, shell_path
+    if not isinstance(tokens, tuple) or len(tokens) != 9:
+        logger.error(f"reset_context expected a tuple of 9 tokens, got {tokens}")
         # Add more robust error handling or logging as needed
         return
 
     # Unpack tokens
-    client_log_token, request_id_token, client_id_token, entry_point_token, user_token, session_id_token, command_seq_token, shell_path_token = tokens
+    client_log_token, request_id_token, client_id_token, entry_point_token, user_token, session_id_token, game_id_token, command_seq_token, shell_path_token = tokens
 
     # Reset each context variable if its token is present (not strictly necessary with .set(None) giving a token)
     _client_log_var.reset(client_log_token)
@@ -378,6 +564,7 @@ def reset_context(tokens: tuple):
     _entry_point_name_var.reset(entry_point_token)
     _user_var.reset(user_token) # user_token will be valid even if user was None
     _session_id_var.reset(session_id_token) # session_id_token will be valid even if session_id was None
+    _game_id_var.reset(game_id_token) # game_id_token will be valid even if game_id was None
     _command_seq_var.reset(command_seq_token) # command_seq_token will be valid even if command_seq was None
     _shell_path_var.reset(shell_path_token) # shell_path_token will be valid even if shell_path was None
 
@@ -714,17 +901,6 @@ async def client_command(command: str, data: Any = None, message_type: str = "co
         RuntimeError: If context variables (client_id, request_id) are not set.
         McpError: Propagated from underlying calls if timeouts or client-side errors occur.
     """
-    # === ENTRY POINT LOGGING - ALWAYS LOG ===
-    logger.warning(f"🚨🚨🚨 CLIENT_COMMAND ENTERED 🚨🚨🚨")
-    logger.warning(f"🚨 Command: '{command}'")
-    logger.warning(f"🚨 First char: '{command[0] if command else 'EMPTY'}' (ord: {ord(command[0]) if command else 'N/A'})")
-    logger.warning(f"🚨 Starts with %: {command.startswith('%') if command else False}")
-    if isinstance(data, (dict, list)):
-        logger.warning(f"🚨 Data:\n{format_json_log(data, colored=True)}")
-    else:
-        logger.warning(f"🚨 Data: {data}")
-    logger.warning(f"🚨🚨🚨 END ENTRY LOG 🚨🚨🚨")
-
     # Get necessary context for routing and correlation
     client_id = _client_id_var.get()
     request_id = _request_id_var.get()
@@ -733,7 +909,12 @@ async def client_command(command: str, data: Any = None, message_type: str = "co
     session_id = _session_id_var.get()  # Which session
     shell_path = _shell_path_var.get()  # Where in the command tree
 
-    logger.warning(f"🚨 Context: client_id={client_id}, request_id={request_id}, entry_point={entry_point_name}, user={user}, session={session_id}, shell={shell_path}")
+    logger.info(f"📡 client_command '{command}' (entry={entry_point_name}, user={user})")
+    if isinstance(data, (dict, list)):
+        logger.debug(f"   📦 data: {format_json_log(data, colored=True)}")
+    elif data is not None:
+        log_data = "[base64 image]" if isinstance(data, str) and data.startswith("data:image/") else data
+        logger.debug(f"   📦 data: {log_data}")
 
     if not client_id or not request_id:
         # This should ideally not happen if called within a proper request context
@@ -744,22 +925,14 @@ async def client_command(command: str, data: Any = None, message_type: str = "co
         # Get current sequence number and increment it for the next call
         # Using the helper function for consistent sequence number management
         current_seq_to_send = await get_and_increment_seq_num(context_name="client_command")
-        logger.warning(f"🚨 Got seq_num: {current_seq_to_send}")
 
-        # Extra distinctive logging for tool calls (commands starting with %)
+        # Extra logging for tool calls (commands starting with %)
         if command.startswith('%'):
-            logger.warning(f"🔧🔧🔧 TOOL CALL DETECTED (% prefix) 🔧🔧🔧")
-            logger.warning(f"🔧 Command: {command}")
-            logger.warning(f"🔧 Client: {client_id}")
-            logger.warning(f"🔧 Request: {request_id}")
-            logger.warning(f"🔧 Seq: {current_seq_to_send}")
-            logger.warning(f"🔧 Data: {format_json_log(data) if isinstance(data, dict) else data}")
-            logger.warning(f"🔧🔧🔧 END TOOL CALL INFO 🔧🔧🔧")
+            logger.info(f"🔧 TOOL CALL seq={current_seq_to_send}: {command}")
+            if isinstance(data, dict):
+                logger.info(f"🔧 TOOL DATA: {format_json_log(data)}")
 
-        logger.warning(f"🚨 About to call execute_client_command_awaitable...")
-        logger.info(f"Atlantis: Sending awaitable command '{command}' for client {client_id}, request {request_id}, seq {current_seq_to_send}")
-        # Call the dedicated utility function for awaitable commands
-        logger.warning(f"🚨 Calling execute_client_command_awaitable with command='{command}'")
+        logger.info(f"📡 Sending awaitable '{command}' seq={current_seq_to_send}")
         result = await execute_client_command_awaitable(
             client_id_for_routing=client_id,
             request_id=request_id,
@@ -773,11 +946,11 @@ async def client_command(command: str, data: Any = None, message_type: str = "co
             message_type=message_type,  # Pass message_type for the protocol
             is_private=is_private  # Pass is_private for broadcast control
         )
-        logger.debug(f"Atlantis: Received result for awaitable command '{command}', type: {type(result)}")
+        logger.debug(f"📡 Result for '{command}': type={type(result).__name__}")
 
         return result
     except Exception as e:
-        logger.warning(f"🚨 EXCEPTION in client_command for '{command}': {type(e).__name__}: {e}")
+        logger.warning(f"❌ client_command '{command}' FAILED: {type(e).__name__}: {e}")
         # Server layer already logged with enhanced error message including command context
         # Just re-raise to let the dynamic function manager handle final logging
         raise

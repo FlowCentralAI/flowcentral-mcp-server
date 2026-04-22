@@ -5,9 +5,9 @@ Create an account at [flowcentral.ai](https://flowcentral.ai) and the bot will w
 
 Basically we have a distributed linux-style system that provides tool infra for bots. Tools are arranged in folders for easy management across functions and teams. Teams can call each other's functions directly or of course the bots can just do things themselves. Under the covers is an MCP-compliant system but we support hotloading etc. without some of the clunky overhead of constantly updating MCP tools.
 
-To get started, clone the repo, do the Python env stuff, set up your API keys as environment variables (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, etc.) and connect this local Python server to the main server (see runServer). We give you all the source code to build your own tool-calling chatbot just like Claude or whatever. See `Bot/Atlas/` for working examples using OpenRouter and Anthropic APIs — the bot discovers tools dynamically via search/dir rather than pre-loading them.
+To get started, clone the repo, do the Python env stuff, set up your API keys as environment variables (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, etc.) and connect this local Python server to the main server (see runServer). We give you all the source code to build your own tool-calling chatbot just like Claude or whatever. See `Games/FlowCentral/Bots/Atlas/` for the bot persona configuration and `Home/chat.py` for the shared chat loop — the bot discovers tools dynamically via search/dir rather than pre-loading them.
 
-*note that Home/game.py is run whenever a new chat is created and will set the default chat tool
+*note that `game_set("FlowCentral")` locks the server to a game, then `character_bot()` assigns bots to roles and `game_move_bot()`/`game_move_human()` handles movement between locations
 
 
 ## FlowCentral Network
@@ -18,12 +18,43 @@ The centerpiece of this project is a Python MCP host (referred to as a 'remote')
 
 ## Quick Start
 
-1. Prerequisites - need to install Python for the server and Node for the MCP client; you should also install uv/uvx and node/npx since it seems that MCP needs both
+1. Prerequisites - need to install Python for the server and Node for Lobster (the MCP client); you should also install uv/uvx and node/npx since it seems that MCP needs both
 
 
 2. Python 3.13 seems to be most stable right now because of async support
 
-3. Edit the runServer script in the `python-server` folder and set the email and service name (it's actually best practice to create a copy "runServerFoo" that you can replace the runServer file with when we do updates):
+3. Set up your Python virtual environment and install dependencies:
+
+```bash
+cd python-server
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+4. Set up your API keys. Create a script in `python-server/` to export your keys (these are gitignored so your keys won't be committed). For example, create `set_OPENROUTER.bat`:
+
+```bash
+#!/bin/bash
+# Usage: source set_OPENROUTER.bat
+
+export OPENROUTER_API_KEY="sk-or-v1-your-key-here"
+
+echo "OPENROUTER_API_KEY has been set"
+```
+
+Create one per provider you need (`set_ANTHROPIC.bat`, `set_GOOGLE.bat`, etc.) following the same pattern. Source them after activating your venv:
+
+```bash
+source venv/bin/activate
+source set_OPENROUTER.bat
+source set_ANTHROPIC.bat      # if using Anthropic models
+source set_GOOGLE.bat         # if using Google APIs
+```
+
+You only need the keys for the providers you plan to use. At minimum, `OPENROUTER_API_KEY` is required for the default bot (Atlas).
+
+6. Edit the runServer script in the `python-server` folder and set the email and service name (it's actually best practice to create a copy "runServerFoo" that you can replace the runServer file with when we do updates):
 
 ```bash
 python server.py  \
@@ -35,7 +66,7 @@ python server.py  \
   --cloud-port=443  \
   --service-name=home                        # remote name, can be anything but must be unique across all machines
 ```
-4. To use this as a regular standalone MCP server, add the following config to Windsurf or Cursor or whatever:
+7. The MCP client is now called **Lobster**. To use this as a regular standalone MCP server, add the following config to Windsurf or Cursor or whatever:
 
 ```json
    "mcpServers": {
@@ -50,21 +81,25 @@ python server.py  \
    }
 ```
 
-To add Atlantis to Claude Code, this should work:
+To add Atlantis to Claude Code:
 
 ```claude mcp add atlantis -- npx atlantis-mcp --port 8000```
+
+To connect to Codex:
+
+```codex mcp add atlantis -- npx atlantis-mcp --port 8000```
 
 To add Atlantis Open Weather for testing:
 
 ```claude mcp add --transport stdio weather_forecast --env OPENWEATHER_API_KEY=mykey123 -- uvx --from atlantis-open-weather-mcp start-weather-server```
 
-5. To connect to FlowCentral, sign into https://www.flowcentral.ai under the same email
+8. To connect to FlowCentral, sign into https://www.flowcentral.ai under the same email
 
-6. Your remote(s) should autoconnect using email and default api key = 'foobar' (see 'api' command to generate a new key later). The first server to connect will be assigned your 'default' unless you manually change it later
+9. Your remote(s) should autoconnect using email and default api key = 'foobar' (see 'api' command to generate a new key later). The first server to connect will be assigned your 'default' unless you manually change it later
 
-7. Initially the functions and servers folders will be empty except for some examples
+10. Initially the functions and servers folders will be empty except for some examples
 
-8. You can run this standalone MCP or accessed from the cloud or both
+11. You can run this standalone MCP or accessed from the cloud or both
 
 ### Architecture
 
@@ -86,14 +121,36 @@ Note that MCP auth and security are still being worked out so using the cloud fo
 1. **Python Remote (MCP P2P server)** (`python-server/`)
    - Location of our 'remote'. Runs locally but can be controlled remotely
 
-2. **MCP Client** (`client/`)
-   - lets you treat the remote like any another MCP
-   - uses npx (easy to install into claude or cursor)
+2. **Lobster (MCP Client)** (`client/`)
+   - lets Claude Code or Codex run Atlantis commands or chat via MCP
+   - uses npx (easy to install into Claude Code or Codex)
    - cloud connection not needed - although it may complain
    - only supports a subset of the spec
    - can only see tools on the local box (at least right now) or shared
      tools set to 'public'
 
+### Python Server Layout
+
+If you are trying to understand the Python source, start in `python-server/server.py` and then branch out from there:
+
+- **`server.py`** - main entry point and protocol host. It starts the Starlette app, owns the `DynamicAdditionServer` class, manages WebSocket and cloud Socket.IO connections, and wires together the function/server managers. If you are tracing a tool invocation, the consolidated MCP `tools/call` handler lives here in `DynamicAdditionServer._handle_tools_call()`, which then delegates to `_execute_tool()`.
+- **`DynamicFunctionManager.py`** - owns the dynamic Python tool system under `dynamic_functions/`. This is where function decorators are defined (`@visible`, `@public`, `@protected`, `@exclude`, etc.), files are scanned and validated, Python modules are loaded/reloaded, and tool calls are dispatched into user code.
+- **`DynamicServerManager.py`** - manages third-party MCP server configs under `dynamic_servers/`. It saves/loads JSON configs, starts stdio MCP servers, keeps sessions alive, and fetches their tool lists.
+- **`atlantis.py`** - the dynamic function harness/runtime API injected into dynamic functions. This is the bridge that tool code uses for `client_log`, streaming, HTML/image/video responses, click/upload callbacks, request context, and persistent shared state. See the [Dynamic Functions Documentation](python-server/README.dynamic_functions.md) for the function-authoring side of this API.
+- **`lobster.py`** - compatibility layer for the local Atlantis MCP client. It defines the `readme` / `command` / `chat` tools and translates those local calls into the cloud-backed command flow.
+- **`state.py`** - central configuration and process-wide state. It sets up logging, defines `FUNCTIONS_DIR` and `SERVERS_DIR`, and stores base server constants like host/port and request timeout.
+- **`utils.py`** - low-level helpers shared across the server and dynamic functions. It contains search-term parsing, JSON/log formatting, the global server-instance bridge, and client command/log plumbing used by `atlantis.py`.
+- **`PIDManager.py`** - single-instance guard for the Python server process via PID files.
+- **`ColoredFormatter.py`** - logging formatter and request-context filter used by `state.py`.
+
+The runtime split is basically:
+
+1. `server.py` receives MCP traffic.
+2. `server.py` routes MCP `tools/call` through `DynamicAdditionServer._handle_tools_call()`.
+3. `_handle_tools_call()` delegates Python tool execution to `DynamicFunctionManager.py` and proxied MCP tool execution to `DynamicServerManager.py`.
+4. Dynamic functions call back into the host through `atlantis.py` and `utils.py`.
+
+For dynamic function authoring details, see [Dynamic Functions Documentation](python-server/README.dynamic_functions.md).
 
 ## Features
 
@@ -126,7 +183,7 @@ For detailed information about creating and using dynamic functions, see the [Dy
    }
    ```
 
-The weather MCP service is available via uvx.
+The weather MCP service is just an existing one ported to uvx. See [here](https://github.com/ProjectAtlantis-dev/atlantis-open-weather-mcp)
 
 
 ## Cloud
@@ -232,23 +289,83 @@ update_image                          ✅ Works fine!
 
 ## Bot: Atlas
 
-Atlas is the front-desk chatbot. There are multiple backend implementations under `python-server/dynamic_functions/Bot/Atlas/`:
+Atlas is the front-desk chatbot for FlowCentral. Bot personas now live inside each game folder, and the shared runtime lives in `Home/`:
 
 ```
-Bot/Atlas/
-├── OpenRouterGLM/main.py     # GLM model via OpenRouter (primary)
-├── OpenRouterAnt/main.py     # Anthropic model via OpenRouter
-├── Ant/main.py               # Direct Anthropic API
-├── system_prompt.py          # Shared system prompt loaded by all backends
-└── visitor_data.json         # Visitor tracking DB (JSON, file-locked)
+Games/FlowCentral/                   # Game definition
+├── Bots/                            # Bot personas for this game
+│   ├── Atlas/
+│   │   ├── config.json              # Model, provider, greeting, handler references
+│   │   ├── system_prompt.md         # Base system prompt (markdown)
+│   │   ├── prompt.py                # System prompt builder with context injection
+│   │   ├── main.py                  # Index placeholder
+│   │   └── atlas_face.jpg           # Bot avatar
+│   └── Celeste/                     # Executive concierge
+│       ├── config.json
+│       ├── system_prompt.md
+│       ├── prompt.py
+│       ├── main.py
+│       └── celeste_face.jpg
+├── Locations/                       # Rooms players can move between
+│   ├── Lobby.json                   # Location metadata + adjacency
+│   ├── Lobby.jpg                    # Background image
+│   ├── Lounge.json
+│   └── Lounge.jpg
+└── Roles/                           # NPC role definitions
+    ├── Greeter/                     # Atlas's role
+    │   ├── system_prompt.md         # Role-specific system prompt
+    │   └── prompt.py
+    └── Concierge/                   # Celeste's role
+        ├── system_prompt.md
+        └── prompt.py
+
+Home/                                # Shared bot + game runtime
+├── chat.py                          # OpenRouter chat completions handler
+├── chat_callback.py                 # Routes chat to correct bot via transcript detection
+├── turn.py                          # Multi-turn LLM conversation loop with tool calls
+├── bot_common.py                    # Shared utils: transcript fetch, tool discovery
+├── game_common.py                   # Character system, movement, bot spawning
+├── main.py                          # game_set(), game_show(), bot_list(), game_move_bot/human()
+├── GAME.md                          # ER diagram of the game data model
+├── MULTIX.md                        # User-facing CLI documentation
+└── README.py                        # Serves MULTIX.md and GAME.md via MCP
+```
+
+### Game system
+
+Games manage bot assignments, character roles, locations, and movement. Everything is scoped per-game:
+
+- **`game_set(name)`** — Locks the server to a game (e.g. `"FlowCentral"`)
+- **`character_bot(sid, role)`** — Assigns a bot to a role (e.g. `character_bot("atlas", "Greeter")`)
+- **`character_human(role, name)`** — Assigns a human player to a role
+- **`game_move_bot(sid, location)`** / **`game_move_human(sid, location)`** — Moves characters between locations
+- **`game_show()`** — Renders a live ER diagram of the game state
+
+Locations are defined as JSON files in `Games/<game>/Locations/` with adjacency graphs (`connects_to`). Movement is only allowed along connected edges. New players start at the default location (marked with `"default": true`).
+
+### Player data
+
+All game state is scoped under `Data/{game_id}/`:
+
+```
+Data/
+├── main.py                          # Game-scoped data helpers
+├── todo.py                          # Todo/task management per session
+└── {game_id}/                       # Per-game data (created at runtime)
+    ├── characters.json              # Bot and human role assignments
+    ├── positions.json               # Current location of each character
+    ├── profiles.json                # Player profiles
+    └── interactions.json            # Per-bot interaction history (timestamps, counts)
 ```
 
 ### Key files
 
 - **`python-server/dynamic_functions/Home/MULTIX.md`** — User-facing documentation for the FlowCentral MCP tools (commands, search terms, tool prefixes, etc.). This is the file served by the `readme` MCP tool.
-- **`OpenRouterGLM/main.py`** — Main chat loop: fetches transcript, checks visitor data, builds the system prompt with visitor context, calls OpenRouter, handles tool calls in a multi-turn loop. Also writes `raw_transcript.json` for debugging what gets sent to the LLM.
-- **`visitor_data.json`** — Tracks per-user visit counts and last visit timestamps. Used by `get_visit_info()` (read) and `record_new_conversation()` (write). Both use `fcntl` file locking.
-- **`Tools/new_guest.py`** — Guest management tools (`new_guest`, `security_cleared`, `list_guests`, `guest_info`) that also read/write `visitor_data.json`.
+- **`Games/FlowCentral/Bots/Atlas/config.json`** — Bot configuration: model (minimax-m2.7), provider (OpenRouter), greeting message, and references for the chat handler and system prompt.
+- **`Home/main.py`** — Game lifecycle tools: `game_set()`, `game_show()`, `bot_list()`, `location_list()`, `game_move_bot()`, `game_move_human()`.
+- **`Home/game_common.py`** — Character system (`character_bot()`, `character_human()`, `character_list()`), movement logic, bot spawning.
+- **`Home/chat_callback.py`** — Chat routing: detects which bot is in the room from the transcript and dispatches to its chat handler.
+- **`Data/main.py`** — Game-scoped data system: positions, profiles, interactions, all under `Data/{game_id}/`.
 
 ### Troubleshooting
 
@@ -265,3 +382,136 @@ tail -1000 python-server/runServer.log
 
 Visitor-related log lines include `"Visitor:"`, `"New conversation for"`, and `"Injected time-gap message"`.
 
+### How to build a new bot
+
+To create a new bot, you need: a persona folder in `Games/<game>/Bots/`, a role in `Games/<game>/Roles/`, and optionally a new location.
+
+**Step 1: Create the persona folder** (`Games/FlowCentral/Bots/YourBot/`)
+
+You need 4-5 files:
+
+**`config.json`** — Model and identity:
+```json
+{
+  "sid": "yourbot",
+  "displayName": "YourBot",
+  "image": "yourbot_face.jpg",
+  "provider": "openrouter",
+  "model": "minimax/minimax-m2.7",
+  "baseUrl": "https://openrouter.ai/api/v1",
+  "apiKeyEnv": "OPENROUTER_API_KEY",
+  "chatHandler": "dynamic_functions.Home.chat.handle_chat_completions",
+  "systemPrompt": "system_prompt.md",
+  "greeting": "Hi, I'm YourBot."
+}
+```
+
+- `sid` — unique bot identifier, used in transcripts and character system
+- `chatHandler` — always `dynamic_functions.Home.chat.handle_chat_completions` (shared runtime)
+- `systemPrompt` — markdown file in the bot's folder containing the base system prompt
+- `image` — avatar image filename in the bot's folder
+- `apiKeyEnv` — environment variable holding the API key
+- `greeting` — what the bot says when it first appears
+
+**`system_prompt.md`** — The bot's personality in plain markdown:
+```markdown
+You are YourBot, a [description of role and personality].
+
+[Instructions for behavior, tone, tools, etc.]
+```
+
+**`prompt.py`** — Builds interaction context (time awareness, returning visitor detection). Copy from `Games/FlowCentral/Bots/Atlas/prompt.py` and adjust as needed.
+
+**`main.py`** — Index placeholder so the bot shows up in tool discovery:
+```python
+import atlantis
+import logging
+
+logger = logging.getLogger("mcp_server")
+
+@visible
+async def index():
+    """YourBot — [role description]."""
+    pass
+```
+
+**`yourbot_face.jpg`** — Avatar image. Shown when the bot spawns.
+
+**Step 2: Create the role** (`Games/FlowCentral/Roles/YourRole/`)
+
+**`system_prompt.md`** — Role-specific system prompt additions:
+```markdown
+You are stationed at [location]. Your job is to [role description].
+```
+
+**`prompt.py`** — Optional role-specific prompt builder. Copy from an existing role if needed.
+
+**`main.py`** — Index placeholder:
+```python
+import atlantis
+import logging
+
+logger = logging.getLogger("mcp_server")
+
+@visible
+async def index():
+    """YourRole — [description]."""
+    pass
+```
+
+**Step 3: Add a location** (optional)
+
+If your bot needs its own room, create a location JSON file in `Games/FlowCentral/Locations/`:
+
+**`YourLocation.json`**:
+```json
+{
+  "name": "YourLocation",
+  "description": "A brief description of this location.",
+  "image": "YourLocation.jpg",
+  "connects_to": ["Lobby"]
+}
+```
+
+Add a background image (`YourLocation.jpg`) to the same `Locations/` folder. Then update the Lobby's `connects_to` array to include `"YourLocation"` so players can travel between the two.
+
+**Step 4: Assign your bot to its role**
+
+Once the game is locked to FlowCentral (via `game_set`), register your bot as a character and assign it to the role you created:
+
+```python
+character_bot("yourbot", "YourRole")
+```
+
+This links the bot's `sid` to the role folder so the system knows which system prompt and behavior to use. If a character with this `sid` already exists, it updates the role instead of creating a duplicate.
+
+**Step 5: Move your bot to its location**
+
+Place your bot in the room where it should greet visitors:
+
+```python
+await game_move_bot("yourbot", "YourLocation")
+```
+
+New bots must enter the default location (the Lobby) first before moving elsewhere — this mirrors how players enter the game. If your bot's location is the Lobby itself, you can omit the location argument.
+
+**Step 6: Spawn the bot**
+
+Show the bot's avatar and have it introduce itself with its configured greeting message:
+
+```python
+await spawn_bot("yourbot")
+```
+
+This displays the bot's face image to the client and sends the greeting as a chat message so the bot appears in the conversation transcript. After this, the chat callback will automatically route incoming messages to your bot based on who's present in the room.
+
+**Putting it all together:**
+
+Here's the full sequence you'd run to bring a new bot online in a session:
+
+```python
+await game_set("FlowCentral")           # Lock server to the game (once per server)
+character_bot("yourbot", "YourRole")     # Assign bot to role
+await game_move_bot("yourbot")           # Enter the default lobby
+await spawn_bot("yourbot")               # Show face + greeting
+```

@@ -16,6 +16,8 @@ import socketio
 import argparse
 import uuid
 import secrets
+import base64
+import mimetypes
 from utils import clean_filename, format_json_log, parse_search_term, write_tools_debug_file
 from PIDManager import PIDManager
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -27,7 +29,7 @@ import traceback
 from collections import defaultdict
 
 # Version
-SERVER_VERSION = "3.8.0"
+SERVER_VERSION = "4.0.2"
 
 # Tool list display column widths
 COL_WIDTH_APP = 30
@@ -530,7 +532,7 @@ class DynamicAdditionServer(Server):
         future = asyncio.get_running_loop().create_future()
         self.awaitable_requests[correlation_id] = future
 
-        logger.info(f"⏳ Preparing awaitable command '{command}' for client {client_id_for_routing} (correlationId: {correlation_id}, MCP_reqId: {request_id})")
+        logger.info(f"⏳ Preparing awaitable command '{command}' (correlationId: {correlation_id})")
 
         payload = {
             "jsonrpc": "2.0",
@@ -603,14 +605,12 @@ class DynamicAdditionServer(Server):
                     "method": "notifications/message",
                     "params": cloud_notification_params
                 }
-                # Extra distinctive logging for tool calls (commands starting with %)
+                # Extra logging for tool calls (commands starting with %)
                 if command.startswith('%'):
-                    logger.info(f"🔧🔧🔧 CLOUD TOOL CALL WIRE FORMAT 🔧🔧🔧")
-                    logger.info(f"🔧 Full cloud_notification_params:\n{format_json_log(cloud_notification_params)}")
-                    logger.info(f"🔧🔧🔧 END WIRE FORMAT 🔧🔧🔧")
-                logger.info(f"☁️ About to send cloud payload with params:\n{format_json_log(cloud_notification_params)}")
+                    logger.info(f"🔧 CLOUD TOOL CALL: {command}")
+                    logger.debug(f"🔧 cloud_notification_params:\n{format_json_log(cloud_notification_params)}")
                 await connection.send_message('mcp_notification', cloud_wrapper_payload)
-                logger.info(f"☁️ Sent awaitable command '{command}' (as flat notifications/message) to cloud client {client_id_for_routing} (correlationId: {correlation_id}) via 'mcp_notification' event")
+                logger.info(f"☁️ Sent '{command}' to cloud (correlationId: {correlation_id})")
             else:
                 self.awaitable_requests.pop(correlation_id, None) # Clean up future
                 logger.error(f"❌ Cannot send awaitable command '{command}': Client '{client_id_for_routing}' has no valid/active connection.")
@@ -621,9 +621,9 @@ class DynamicAdditionServer(Server):
                 raise McpError(error_data)
 
             # Wait for the future to be resolved
-            logger.debug(f"⏳ Waiting for response for command '{command}' (correlationId: {correlation_id}) timeout: {self.awaitable_request_timeout}s")
+            logger.debug(f"⏳ Waiting for '{command}' (correlationId: {correlation_id}) timeout: {self.awaitable_request_timeout}s")
             result = await asyncio.wait_for(future, timeout=self.awaitable_request_timeout)
-            logger.info(f"✅ Received response for awaitable command '{command}' (correlationId: {correlation_id})")
+            logger.info(f"✅ Received response for '{command}' (correlationId: {correlation_id})")
             # Clear duplicate tracking on success so same command can be called again later
             # DISABLED: Duplicate tracking disabled
             # self._command_counts_per_context.pop(tracking_key, None)
@@ -797,6 +797,36 @@ class DynamicAdditionServer(Server):
                 logger.warning(f"🧹 Final cleanup: Future for stream {correlation_id} was still in awaitable_requests.")
                 self.awaitable_requests.pop(correlation_id, None)
 
+    async def _get_dynamic_index_filter(self, app_name: str) -> set[str] | None:
+        """
+        Check if an app/folder has a @dynamic @index function.
+        If so, call it and return a set of allowed tool names.
+        Returns None if no dynamic index exists or it doesn't return a list.
+        """
+        metadata_by_func = self.function_manager._function_metadata_by_app.get(app_name, {})
+        index_meta = metadata_by_func.get('index')
+        if not index_meta:
+            return None
+        if not index_meta.get('is_dynamic'):
+            return None
+
+        try:
+            result = await self.function_manager.function_call(
+                name='index',
+                client_id=None,
+                request_id=None,
+                user=None,
+                app=self.function_manager._path_to_app_name(app_name) if app_name else None,
+            )
+            if isinstance(result, list):
+                logger.info(f"🔍 Dynamic index for app '{app_name}' returned {len(result)} tool(s): {result}")
+                return set(result)
+            else:
+                return None
+        except Exception as e:
+            logger.warning(f"⚠️ Error calling dynamic index for app '{app_name}': {e}")
+            return None
+
     async def _create_tools_from_app_mappings(self) -> list[Tool]:
         """Create tools from app-specific function mappings, showing all function variants"""
         tools_list = []
@@ -812,6 +842,7 @@ class DynamicAdditionServer(Server):
 
         # For each app and function in the app-specific mappings, create Tool entries
         for app_name, app_mapping in function_mapping_by_app.items():
+            app_tools = []  # Collect tools for this app, then apply dynamic index filter
             for func_name, file_path in app_mapping.items():
                 try:
                     # Skip if this seems to be a utility file
@@ -962,12 +993,23 @@ class DynamicAdditionServer(Server):
 
                             # No need for duplicate detection here - only processing functions in the mapping
                             # Duplicates were already detected and removed by DynamicFunctionManager
-                            tools_list.append(tool_obj)
+                            app_tools.append(tool_obj)
                             #logger.debug(f"📝 Added dynamic tool: {tool_name} (app: {actual_app_name}), valid: {is_valid}")
 
                 except Exception as e:
                     logger.warning(f"⚠️ Error processing function {func_name} from {file_path}: {str(e)}")
                     continue
+
+            # Apply dynamic index filter: if this app has a @dynamic index(), only keep tools it returns
+            dynamic_index_filter = await self._get_dynamic_index_filter(app_name)
+            if dynamic_index_filter is not None:
+                before_count = len(app_tools)
+                app_tools = [t for t in app_tools if t.name in dynamic_index_filter or t.name == 'index']
+                filtered_count = before_count - len(app_tools)
+                if filtered_count > 0:
+                    logger.info(f"🔍 Dynamic index filter for app '{app_name}': kept {len(app_tools)}/{before_count} tools")
+
+            tools_list.extend(app_tools)
 
         return tools_list
 
@@ -1098,17 +1140,17 @@ class DynamicAdditionServer(Server):
             ),
             Tool(
                 name="_function_move",
-                description="Moves a function from one app to another. Gets the function code from source, adds it to destination, and removes it from source.",
+                description="Moves a function from one app to another. Gets the function code from source, adds it to destination, and removes it from source. Can also rename an app folder when both source_name and dest_name are empty (folder rename mode).",
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "source_name": {"type": "string", "description": "The name of the function to move"},
-                        "source_app": {"type": "string", "description": "Optional: The source app name to target a specific function when multiple exist with the same name"},
-                        "dest_app": {"type": "string", "description": "The destination app name to move the function to"},
-                        "dest_name": {"type": "string", "description": "Optional: New name for the function (defaults to source_name)"},
+                        "source_name": {"type": "string", "description": "The name of the function to move. Leave empty with empty dest_name to rename a folder/app instead."},
+                        "source_app": {"type": "string", "description": "The source app name. Required for folder rename mode."},
+                        "dest_app": {"type": "string", "description": "The destination app name to move the function to, or the new app/folder name for folder rename mode."},
+                        "dest_name": {"type": "string", "description": "Optional: New name for the function (defaults to source_name). Leave empty with empty source_name for folder rename."},
                         "dest_location": {"type": "string", "description": "Optional: Adds @location() decorator with the specified location value"}
                     },
-                    "required": ["source_name", "dest_app"]
+                    "required": ["dest_app"]
                 },
                 annotations=ToolAnnotations(title="_function_move")
             ),
@@ -2160,6 +2202,7 @@ class DynamicAdditionServer(Server):
         request_id: Optional[str],
         user: Optional[str],
         session_id: Optional[str],
+        game_id: Optional[str] = None,
     ) -> Any:
         if actual_function_name == "_function_set":
             logger.debug(f"---> Calling built-in: function_set")
@@ -2235,16 +2278,28 @@ class DynamicAdditionServer(Server):
         elif actual_function_name == "_function_move":
             logger.debug(f"---> Calling built-in: function_move with args:\n{format_json_log(args)}")
 
-            source_name = args.get("source_name")
-            source_app = args.get("source_app")
-            dest_app = args.get("dest_app")
-            dest_name = args.get("dest_name")
+            source_name = args.get("source_name", "")
+            source_app = args.get("source_app", "")
+            dest_app = args.get("dest_app", "")
+            dest_name = args.get("dest_name", "")
             dest_location = args.get("dest_location")
+
+            if not dest_app:
+                raise ValueError("Missing required parameter: dest_app")
+
+            # Folder rename mode: both source_name and dest_name are empty
+            if not source_name and not dest_name:
+                if not source_app:
+                    raise ValueError("source_app is required for folder rename mode")
+                try:
+                    result_msg = await self.function_manager.folder_rename(source_app, dest_app)
+                    await self._notify_tool_list_changed(change_type="updated", tool_name=dest_app)
+                    return result_msg
+                except (ValueError, IOError) as e:
+                    return str(e)
 
             if not source_name:
                 raise ValueError("Missing required parameter: source_name")
-            if not dest_app:
-                raise ValueError("Missing required parameter: dest_app")
 
             try:
                 result_msg = await self.function_manager.function_move(
@@ -2506,6 +2561,7 @@ class DynamicAdditionServer(Server):
                         request_id=request_id,
                         user=user,
                         session_id=session_id,
+                        game_id=game_id,
                         app=None,
                         args={}
                     )
@@ -2546,6 +2602,7 @@ class DynamicAdditionServer(Server):
                         request_id=request_id,
                         user=user,
                         session_id=session_id,
+                        game_id=game_id,
                         app=None,
                         args={"filename": filename, "filetype": filetype, "base64Content": base64Content}
                     )
@@ -2735,6 +2792,7 @@ async def index():
         request_id: Optional[str],
         user: Optional[str],
         session_id: Optional[str],
+        game_id: Optional[str],
         command_seq: Optional[int],
         shell_path: Optional[str],
     ) -> Any:
@@ -2758,6 +2816,7 @@ async def index():
                 request_id=request_id,
                 user=user,
                 session_id=session_id,
+                game_id=game_id,
                 command_seq=command_seq,
                 shell_path=shell_path,
                 app=parsed_app_name,
@@ -2773,7 +2832,7 @@ async def index():
         except Exception:
             raise
 
-    async def _execute_tool(self, name: str, args: dict, client_id: Optional[str] = None, request_id: Optional[str] = None, user: Optional[str] = None, session_id: Optional[str] = None, command_seq: Optional[int] = None, shell_path: Optional[str] = None) -> ToolResult:
+    async def _execute_tool(self, name: str, args: dict, client_id: Optional[str] = None, request_id: Optional[str] = None, user: Optional[str] = None, session_id: Optional[str] = None, game_id: Optional[str] = None, command_seq: Optional[int] = None, shell_path: Optional[str] = None) -> ToolResult:
         """Core logic to handle a tool call. Returns ToolResult with raw value.
 
         MCP response formatting (content + structuredContent) happens in
@@ -2785,6 +2844,8 @@ async def index():
             logger.debug(f"CALLED BY USER: {user}")
         if session_id:
             logger.debug(f"SESSION ID: {session_id}")
+        if game_id:
+            logger.debug(f"GAME ID: {game_id}")
         # ---> ADDED: Log entry and raw args
         logger.debug(f"---> _execute_tool ENTERED. Name: '{name}', Raw Args:\n{format_json_log(args) if isinstance(args, dict) else args!r}") # <-- ADD THIS LINE
 
@@ -2833,6 +2894,7 @@ async def index():
                 request_id=request_id,
                 user=user,
                 session_id=session_id,
+                game_id=game_id,
             )
 
             if result_raw is BUILTIN_NOT_HANDLED:
@@ -2859,6 +2921,7 @@ async def index():
                         request_id=request_id,
                         user=user,
                         session_id=session_id,
+                        game_id=game_id,
                         command_seq=command_seq,
                         shell_path=shell_path,
                     )
@@ -2964,6 +3027,7 @@ async def index():
         # Extract optional context fields
         user = params.get("user", None)
         session_id = params.get("session_id", None)
+        game_id = params.get("game_id", None)
         command_seq = params.get("command_seq", None)
         shell_path = params.get("shell_path", None)
 
@@ -2982,8 +3046,10 @@ async def index():
             logger.debug(f"Call made by user: {user}")
         if session_id:
             logger.debug(f"Call made with session_id: {session_id}")
+        if game_id:
+            logger.debug(f"Call made with game_id: {game_id}")
         if for_cloud:
-            logger.info(f"☁️ CLOUD TOOL CALL - Tool: '{tool_name}', User: '{user}', Session: '{session_id}', Seq: {command_seq}")
+            logger.info(f"☁️ CLOUD TOOL CALL - Tool: '{tool_name}', User: '{user}', Session: '{session_id}', Game: '{game_id}', Seq: {command_seq}")
 
         # Log the tool execution (don't re-register connections here)
         if for_cloud:
@@ -3034,7 +3100,20 @@ async def index():
 
                 # Send awaitable command to cloud client
                 # For lobster tools, use the lobster request_id from cloud
+                context_tokens = None
                 try:
+                    # Set logging context so log lines show [reqId-shell] instead of [------]
+                    lobster_shell = getattr(self.cloud_client, 'lobster_shell_path', None) if hasattr(self, 'cloud_client') and self.cloud_client else None
+                    context_tokens = atlantis.set_context(
+                        client_log_func=lambda message, level="INFO", message_type="text": None,
+                        request_id=request_id,
+                        client_id=client_id,
+                        entry_point_name=f"lobster_{tool_name}",
+                        user=user,
+                        session_id=session_id,
+                        game_id=game_id,
+                        shell_path=lobster_shell or shell_path,
+                    )
                     lobster_req_id = self.cloud_client.lobster_request_id if hasattr(self, 'cloud_client') and self.cloud_client else None
                     return await handle_local_lobster_tool_call(
                         self,
@@ -3055,6 +3134,9 @@ async def index():
                             "message": f"Error communicating with cloud: {str(e)}"
                         }
                     }
+                finally:
+                    if context_tokens:
+                        atlantis.reset_context(context_tokens)
 
             # If we get here, it's an unexpected tool for local connections
             logger.warning(f"⚠️ Unexpected tool call from local client: {tool_name}")
@@ -3076,6 +3158,7 @@ async def index():
                 request_id=request_id,
                 user=user,
                 session_id=session_id,
+                game_id=game_id,
                 command_seq=command_seq,
                 shell_path=shell_path
             )
@@ -3254,15 +3337,37 @@ async def get_all_tools_for_response(server: 'DynamicAdditionServer', caller_con
     tools_dict_list: List[Dict[str, Any]] = []
     for tool in raw_tool_list:
         try:
+            original_annotations: Dict[str, Any] = {}
             # Debug log to see all tools and their annotations BEFORE serialization
             #logger.debug(f"🔍 SERIALIZING TOOL '{tool.name}' with annotations: {getattr(tool, 'annotations', None)}")
             if hasattr(tool, 'annotations') and isinstance(tool.annotations, dict):
                 source_file = tool.annotations.get('sourceFile', 'NOT_FOUND')
+                original_annotations = tool.annotations.copy()
             elif hasattr(tool, 'annotations') and hasattr(tool.annotations, 'sourceFile'):
                 source_file = getattr(tool.annotations, 'sourceFile', 'NOT_FOUND')
+                if hasattr(tool.annotations, 'model_dump'):
+                    try:
+                        original_annotations = tool.annotations.model_dump(mode='json')
+                    except Exception:
+                        original_annotations = {}
+                extra_annotations = getattr(tool.annotations, '__pydantic_extra__', None)
+                if isinstance(extra_annotations, dict):
+                    original_annotations.update(extra_annotations)
+                elif hasattr(tool.annotations, '__dict__'):
+                    for key, value in vars(tool.annotations).items():
+                        if not key.startswith('_'):
+                            original_annotations.setdefault(key, value)
 
             # Ensure model_dump is called correctly for each tool
             tool_dict = tool.model_dump(mode='json') # Use mode='json' for better serialization
+
+            if original_annotations:
+                serialized_annotations = tool_dict.get('annotations')
+                if not isinstance(serialized_annotations, dict):
+                    tool_dict['annotations'] = original_annotations.copy()
+                else:
+                    for key, value in original_annotations.items():
+                        serialized_annotations.setdefault(key, value)
 
             # Debug log for all tools AFTER serialization
             annotations = tool_dict.get('annotations') if tool_dict else None
@@ -3361,13 +3466,30 @@ class ServiceClient:
 
     Manages the Socket.IO connection to the cloud server's service namespace.
     """
-    def __init__(self, appName:str, server_url: str, namespace: str, email: str, api_key: str, serviceName: str, mcp_server: 'DynamicAdditionServer', port: int):
+    @staticmethod
+    def _encode_image(image_path: str) -> str:
+        """Read an image file and return a base64 data URI string."""
+        if not image_path:
+            return ""
+        try:
+            resolved = os.path.abspath(image_path)
+            mime_type = mimetypes.guess_type(resolved)[0] or "image/png"
+            with open(resolved, "rb") as f:
+                encoded = base64.b64encode(f.read()).decode("utf-8")
+            return f"data:{mime_type};base64,{encoded}"
+        except Exception as e:
+            logger.warning(f"⚠️ Could not read image '{image_path}': {e}")
+            return ""
+
+    def __init__(self, appName:str, server_url: str, namespace: str, email: str, api_key: str, serviceName: str, mcp_server: 'DynamicAdditionServer', port: int, description: str = "", image: str = ""):
         self.server_url = server_url
         self.namespace = namespace
         self.email = email
         self.api_key = api_key
         self.appName = appName
         self.serviceName = serviceName
+        self.description = description
+        self.image = self._encode_image(image)
         self.mcp_server = mcp_server
         self.server_port = port # Store the server's listening port
         self.sio = None
@@ -3380,6 +3502,10 @@ class ServiceClient:
         self._creation_time = int(time.time())
         # Store the lobster request_id received from cloud for unsolicited requests
         self.lobster_request_id = None
+        # Store the lobster shell path received from cloud welcome
+        self.lobster_shell_path = None
+        # Store the lobster game ID received from lobsterShell event
+        self.lobster_game_id = None
         # Throttle repeated identical connect_error logs while the cloud is down.
         self._connect_error_signature = None
         self._connect_error_last_logged_at = None
@@ -3538,13 +3664,17 @@ class ServiceClient:
                 if 'session' in decorators:
                     visibility_str += f" {MAGENTA}[@session]{RESET_COLOR}"
                 if 'game' in decorators:
-                    visibility_str += f" {MAGENTA}[@game]{RESET_COLOR}"
+                    visibility_str += f" {CYAN_COLOR}[@game]{RESET_COLOR}"
+                if 'dynamic' in decorators:
+                    visibility_str += f" {MAGENTA}[@dynamic]{RESET_COLOR}"
                 if 'app' in decorators:
                     visibility_str += f" {CYAN_COLOR}[@app]{RESET_COLOR}"
                 if 'location' in decorators:
                     visibility_str += f" {GREY_COLOR}[@location]{RESET_COLOR}"
                 if 'copy' in decorators:
                     visibility_str += f" {CYAN_COLOR}[@copy]{RESET_COLOR}"
+                if 'exclude' in decorators:
+                    visibility_str += f" {RED}[@exclude]{RESET_COLOR}"
 
             # Add index indicator if function is marked as index
             if is_index:
@@ -3733,7 +3863,10 @@ class ServiceClient:
                     "port": self.server_port, # Send the stored port
                     "serverVersion": SERVER_VERSION,
                     "pythonVersion": sys.version.split()[0],
-                    "mcpVersion": importlib.metadata.version('mcp')
+                    "mcpVersion": importlib.metadata.version('mcp'),
+                    "pid": os.getpid(),
+                    "description": self.description,
+                    "image": self.image
                 }
                 logger.info(f"🔐 Connecting with auth: email={self.email}, serviceName={self.serviceName}, appName={self.appName}, hostname={hostname}")
                 await self.sio.connect(
@@ -3844,12 +3977,17 @@ class ServiceClient:
             logger.info("") # Blank line after
             logger.info(f"{BOLD}{BRIGHT_WHITE}REMOTE NAME : {self.serviceName}{RESET}")
             logger.info(f"{BOLD}{BRIGHT_WHITE}APP NAME    : {self.appName}{RESET}")
+            if self.description:
+                logger.info(f"{BOLD}{BRIGHT_WHITE}DESCRIPTION : {self.description}{RESET}")
+            if self.image:
+                logger.info(f"{BOLD}{BRIGHT_WHITE}IMAGE       : <set>{RESET}")
             logger.info(f"{BOLD}{BRIGHT_WHITE}OWNER       : {atlantis._owner}{RESET}")
             logger.info(f"{BOLD}{BRIGHT_WHITE}OWNER USERS : {atlantis._owner_usernames}{RESET}")
             logger.info(f"{BOLD}{BRIGHT_WHITE}LOGIN       : {self.email}{RESET}")
             logger.info(f"{BOLD}{BRIGHT_WHITE}VERSION     : {SERVER_VERSION}{RESET}")
             logger.info(f"{BOLD}{BRIGHT_WHITE}CLOUD URL   : {self.server_url}{RESET}")
             logger.info(f"{BOLD}{BRIGHT_WHITE}LOCAL PORT  : {self.server_port}{RESET}")
+            logger.info(f"{BOLD}{BRIGHT_WHITE}PID         : {os.getpid()}{RESET}")
             logger.info("") # Blank line after
             logger.info("") # Blank line after
 
@@ -3867,7 +4005,16 @@ class ServiceClient:
             # Report tools to console
             await self._report_tools_to_console()
 
-
+        @self.sio.event(namespace=self.namespace)
+        async def lobsterShell(data):
+            shell_path = data.get("shellPath") if isinstance(data, dict) else None
+            game_id = data.get("gameId") if isinstance(data, dict) else None
+            if shell_path:
+                self.lobster_shell_path = shell_path
+                self.lobster_game_id = game_id
+                logger.info(f"\033[1;91m🦞 Lobster shell path: {shell_path}" + (f" (game {game_id})" if game_id else "") + "\033[0m")
+            else:
+                logger.warning(f"🦞 Received lobsterShell event with no shellPath: {data}")
 
         # Connection error event
         @self.sio.event(namespace=self.namespace)
@@ -4372,17 +4519,7 @@ async def handle_health_check(request: Request) -> JSONResponse:
 
 class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        # Override the max body size for large file uploads
-        original_receive = request.receive
-
-        async def custom_receive():
-            message = await original_receive()
-            # Allow up to 100MB body size
-            if message['type'] == 'http.request' and 'body' in message:
-                return message
-            return message
-
-        request.receive = custom_receive
+        # Allow up to 100MB body size (pass through)
         return await call_next(request)
 
 app = Starlette(
@@ -4409,6 +4546,8 @@ if __name__ == "__main__":
     parser.add_argument("--api-key", help="Service API key for cloud authentication")
     parser.add_argument("--service-name", help="Desired service name")
     parser.add_argument("--app-name", help="App name for cloud authentication")
+    parser.add_argument("--description", default="", help="Friendly description string for the service")
+    parser.add_argument("--image", default="", help="Image path or URL for the service")
     parser.add_argument("--no-cloud", action="store_true", help="Disable cloud server connection")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], default="INFO", help="Set the logging level")
     args = parser.parse_args()
@@ -4550,7 +4689,9 @@ if __name__ == "__main__":
                     serviceName=args.service_name,
                     appName = args.app_name,
                     mcp_server=mcp_server,
-                    port=PORT # Pass the listening port
+                    port=PORT, # Pass the listening port
+                    description=args.description,
+                    image=args.image
                 )
                 # Store cloud client reference on server for tool reporting
                 mcp_server.cloud_client = cloud_connection

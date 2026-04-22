@@ -1,9 +1,18 @@
 import atlantis
 import asyncio
+import re
 
 from openai import OpenAI
 import json
 from typing import List, Dict, Any, Optional, TypedDict, Tuple, cast, NotRequired
+from dynamic_functions.Tools.todo import TODO_PSEUDO_TOOL, handle_todo_tool, list_tasks as _list_tasks, _read_store
+
+# =============================================================================
+# Bot Identity — change these to re-skin for a different bot
+# =============================================================================
+BOT_SID = "atlas"              # sid used in transcript events and stream calls
+BOT_DISPLAY_NAME = "Atlas"     # display name shown in chat bubbles
+BOT_SESSION_PREFIX = "atlas"   # prefix for session-scoped keys (busy, tools, lookup)
 
 
 # =============================================================================
@@ -124,6 +133,49 @@ def get_consolidated_full_name(tool: ToolT) -> str:
         return parts[-1]
 
     return '*'.join(parts)
+
+
+def _repair_json(raw: str) -> Optional[Dict[str, Any]]:
+    """Try to fix common LLM JSON mistakes before giving up.
+
+    Handles: single quotes, trailing commas, unquoted keys,
+    Python booleans (True/False/None), and single-quoted strings
+    with embedded double quotes.
+    """
+    s = raw.strip()
+
+    # 1. Python literals (True -> true, False -> false, None -> null)
+    s = re.sub(r'\bTrue\b', 'true', s)
+    s = re.sub(r'\bFalse\b', 'false', s)
+    s = re.sub(r'\bNone\b', 'null', s)
+
+    # 2. Replace single-quoted strings with double-quoted strings
+    #    Match: 'some text' but be careful about apostrophes
+    s = re.sub(r"(?<=[\[{,:\s])\s*'([^']*?)'\s*(?=[,\]}:])", r'"\1"', s)
+
+    # 3. Trailing commas before } or ]
+    s = re.sub(r',\s*([}\]])', r'\1', s)
+
+    # 4. Unquoted keys:  { foo: ... } -> { "foo": ... }
+    s = re.sub(r'(?<=[{,])\s*([a-zA-Z_]\w*)\s*:', r' "\1":', s)
+
+    try:
+        result = json.loads(s)
+        if isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # 5. Last resort: ast.literal_eval for Python dict literals
+    try:
+        import ast
+        result = ast.literal_eval(raw.strip())
+        if isinstance(result, dict):
+            return result
+    except (ValueError, SyntaxError):
+        pass
+
+    return None
 
 
 def coerce_args_to_schema(args: Dict[str, Any], schema: ToolSchemaT) -> Dict[str, Any]:
@@ -333,12 +385,30 @@ async def fetch_skill_contents(dir_command: str) -> List[str]:
 async def show_tools() -> List[Dict[str, Any]]:
     """Show Atlas's current tool inventory for this session."""
     tools, lookup = get_session_tools()
-    simple: List[Dict[str, Any]] = [
-        {'name': t['function']['name'], 'description': t['function']['description']}
-        for t in tools
-    ]
+    simple: List[Dict[str, Any]] = []
+    for t in tools:
+        fn = t['function']
+        params = fn.get('parameters', {}).get('properties', {})
+        parts = []
+        for pname, pinfo in params.items():
+            ptype = pinfo.get('type', 'any')
+            if isinstance(ptype, list):
+                ptype = ','.join(ptype)
+            parts.append(f"{pname}:{ptype}")
+        sig = ', '.join(parts)
+        simple.append({
+            'name': f"{fn['name']} ({sig})",
+            'description': fn.get('description', ''),
+        })
     logger.info(f"show_tools: {len(simple)} tools")
     return simple
+
+
+@visible
+async def show_todos():
+    """Show Atlas's current todo/task list for this session."""
+    return await _list_tasks()
+
 
 @visible
 async def fetch_skills() -> List[str]:
@@ -359,15 +429,15 @@ def build_visitor_context(caller: str, visit_count: int, last_visit: str) -> str
 
     if visit_count == 1:
         if late_night:
-            visitor_note = f"This is {caller}'s first time here. It's late — their helicopter probably just arrived behind schedule, likely delayed by weather. Welcome them warmly, they've had a long trip."
+            visitor_note = "A new visitor just arrived. It's late — welcome them warmly, they may have had a long day. You don't know their name yet — ask for it naturally."
         else:
-            visitor_note = f"This is {caller}'s first time here. They're brand new — introduce yourself, welcome them warmly, and help them get oriented."
+            visitor_note = "A new visitor just arrived. They're brand new — introduce yourself, welcome them warmly, and help them get oriented. You don't know their name yet — ask for it naturally."
     elif visit_count <= 5:
         visitor_note = f"{caller} has visited {visit_count} times. They're still fairly new — be friendly and remember they might still be figuring things out."
     else:
         visitor_note = f"{caller} has visited {visit_count} times. They're a regular — skip the intros, be casual, and treat them like a friend."
 
-    if last_visit:
+    if last_visit and visit_count > 1:
         try:
             elapsed = datetime.now() - datetime.fromisoformat(last_visit)
             days = elapsed.days
@@ -412,53 +482,7 @@ def build_system_prompt(
     return "\n\n".join(parts)
 
 
-VISITOR_LOG_FILE = os.path.join(os.path.dirname(__file__), '..', 'visitor_data.json')
-
-import fcntl
-
-def get_visit_info(caller: str) -> Tuple[int, str]:
-    """Get visit info for the caller. Returns (visit_count, last_visit_iso). Does not modify the log."""
-    os.makedirs(os.path.dirname(VISITOR_LOG_FILE), exist_ok=True)
-
-    try:
-        with open(VISITOR_LOG_FILE, 'r') as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            try:
-                raw = f.read()
-                log = json.loads(raw) if raw.strip() else {}
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-    except FileNotFoundError:
-        return 0, ""
-
-    entry = log.get(caller, {"count": 0, "last_visit": ""})
-    if isinstance(entry, int):
-        entry = {"count": entry, "last_visit": ""}
-
-    return entry["count"], entry["last_visit"]
-
-
-def record_new_conversation(caller: str):
-    """Increment visit count and update timestamp. Called on first visit or when >1hr gap detected."""
-    now = datetime.now().isoformat()
-    with open(VISITOR_LOG_FILE, 'a+') as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            f.seek(0)
-            raw = f.read()
-            log = json.loads(raw) if raw.strip() else {}
-            entry = log.get(caller, {"count": 0, "last_visit": ""})
-            if isinstance(entry, int):
-                entry = {"count": entry, "last_visit": ""}
-            entry["count"] = entry["count"] + 1
-            entry["last_visit"] = now
-            log[caller] = entry
-            f.seek(0)
-            f.truncate()
-            json.dump(log, f, indent=2)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-    logger.info(f"New conversation for {caller}: visit #{entry['count']}, timestamp {now}")
+from dynamic_functions.Tools.visitor import get_visit_info, record_new_conversation, is_checkin_complete
 
 
 SEARCH_PSEUDO_TOOL: TranscriptToolT = {
@@ -596,12 +620,9 @@ async def handle_search_tool(
 
 
 def find_last_chat_entry(transcript):
-    """Find the last entry in transcript where type is 'chat', skipping thinking entries"""
+    """Find the last entry in transcript where type is 'chat' (including thinking entries)."""
     for entry in reversed(transcript):
         if entry.get('type') == 'chat':
-            who = entry.get('who', '')
-            if 'thinking' in str(who).lower():
-                continue
             return entry
     return None
 
@@ -612,11 +633,13 @@ async def fetch_transcript() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]
     Returns (raw_transcript, processed_transcript) so caller can handle skip logic.
     Can be called directly for testing.
     """
+    logger.info("fetch_transcript: /silent on")
     await atlantis.client_command("/silent on")
-    logger.info("Fetching transcript from client...")
+    logger.info("fetch_transcript: /transcript get")
     raw_transcript = await atlantis.client_command("/transcript get")
-    logger.info(f"Received rawTranscript with {len(raw_transcript)} entries")
+    logger.info(f"fetch_transcript: received {len(raw_transcript)} entries")
     await atlantis.client_command("/silent off")
+    logger.info("fetch_transcript: /silent off")
 
     if not raw_transcript:
         logger.error("!!! CRITICAL: rawTranscript is EMPTY - no messages received from client!")
@@ -672,7 +695,7 @@ async def fetch_transcript() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]
                 logger.warning(f"       -> SKIPPED (oversized: {len(msg_content_full)} chars > {MAX_ENTRY_SIZE})")
                 continue
 
-            role_for_llm = 'assistant' if msg_sid == 'atlas' else 'user'
+            role_for_llm = 'assistant' if msg_sid == BOT_SID else 'user'
 
             transcript.append({'role': role_for_llm, 'content': [{'type': 'text', 'text': msg_content_full}]})
             logger.info(f"       -> INCLUDED as role={role_for_llm} (sid={msg_sid})")
@@ -686,16 +709,19 @@ async def fetch_transcript() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]
 
 
 # Session-scoped keys — stored in session_shared (auto-scoped per user session)
-_BUSY_KEY = "atlas_busy"
-_TOOLS_KEY = "atlas_tools"
-_LOOKUP_KEY = "atlas_lookup"
+def _busy_key() -> str:
+    """BUSY lock key scoped to session only — no shell, so concurrent chats on different shells still block."""
+    return f"{BOT_SESSION_PREFIX}_busy"
+_TOOLS_KEY = f"{BOT_SESSION_PREFIX}_tools"
+_LOOKUP_KEY = f"{BOT_SESSION_PREFIX}_lookup"
+
 
 def get_session_tools() -> Tuple[List[TranscriptToolT], Dict[str, ToolLookupInfo]]:
     """Get or initialize tool inventory for the current session."""
     tools = atlantis.session_shared.get(_TOOLS_KEY)
     lookup = atlantis.session_shared.get(_LOOKUP_KEY)
     if tools is None:
-        tools = [SEARCH_PSEUDO_TOOL, DIR_PSEUDO_TOOL]
+        tools = [SEARCH_PSEUDO_TOOL, DIR_PSEUDO_TOOL, TODO_PSEUDO_TOOL]
         atlantis.session_shared.set(_TOOLS_KEY, tools)
     if lookup is None:
         lookup = {}
@@ -715,15 +741,17 @@ async def chat():
     logger.info("=" * 60)
     logger.info(f"=== CHAT TRIGGERED === session={sessionId} request={requestId} caller={caller}")
 
-    # Check if this session is already being handled
-    owner_req = atlantis.session_shared.get(_BUSY_KEY)
+    # Check if this session+shell is already being handled
+    busy_key = _busy_key()
+    owner_req = atlantis.session_shared.get(busy_key)
     if owner_req:
-        logger.warning(f"🔒 BUSY: session={sessionId} already owned by request={owner_req}, this request={requestId} — skipping")
+        logger.warning(f"🔒 BUSY: session={sessionId} shell key={busy_key} already owned by request={owner_req}, this request={requestId} — skipping")
         await atlantis.owner_log(f"Skipping chat — session {sessionId} busy (owned by request {owner_req})")
         return
 
-    atlantis.session_shared.set(_BUSY_KEY, requestId)
-    logger.info(f"🔒 ACQUIRED: session={sessionId} by request={requestId}")
+    atlantis.session_shared.set(busy_key, requestId)
+    logger.info(f"🔒 ACQUIRED: session={sessionId} shell key={busy_key} by request={requestId}")
+    accumulated_text = ""
 
     try:
         import time as _t
@@ -749,7 +777,7 @@ async def chat():
         last_chat_entry = find_last_chat_entry(rawTranscript)
         if last_chat_entry:
             logger.info(f"  Last chat entry: sid={last_chat_entry.get('sid')} type={last_chat_entry.get('type')} content={str(last_chat_entry.get('content',''))[:80]}")
-        if last_chat_entry and last_chat_entry.get('type') == 'chat' and last_chat_entry.get('sid') == 'atlas':
+        if last_chat_entry and last_chat_entry.get('type') == 'chat' and last_chat_entry.get('sid') == BOT_SID:
             logger.warning(f"\x1b[38;5;204mLast chat was from atlas — skipping (session={sessionId} request={requestId})\x1b[0m")
             await atlantis.owner_log(f"Skipping response - last chat was from atlas")
             return
@@ -759,7 +787,7 @@ async def chat():
         logger.info(f"Visitor: {caller}, visit #{prev_count}, last visit: {prev_last_visit or 'first time'}")
 
         # Fetch skills for system prompt
-        logger.info(f">>> Fetching skills...")
+        logger.info(">>> Fetching skills...")
         t0 = _t.monotonic()
         await atlantis.client_command("/silent on")
         skill_texts = await fetch_skills()
@@ -785,6 +813,27 @@ async def chat():
         model = "z-ai/glm-5"
         logger.info(f"Using model: {model}")
 
+        # Check if guest needs the new guest procedure:
+        # Either brand new (count == 0) or never completed check-in (no greeted + first_name)
+        needs_checkin = prev_count == 0 or not is_checkin_complete(caller)
+        if needs_checkin:
+            logger.info(f"Guest needs check-in: prev_count={prev_count}, checkin_complete={is_checkin_complete(caller)}")
+            # Check if the guest already has a checklist loaded from a previous turn
+            existing_todos = _read_store(caller)
+            if existing_todos:
+                # Checklist already loaded — tell the LLM to continue where it left off
+                transcript.append({'role': 'system', 'content': [{'type': 'text', 'text':
+                    "[PROCEDURE IN PROGRESS] This guest is mid-check-in. Your checklist is already loaded in the `todo` tool — do NOT call `get_guest_checklist` again. Call `todo` (no arguments) to see your current progress, then continue working through the remaining pending steps. Use `todo` with merge=true to update each step's status as you go. You do NOT know their name or username yet unless you have already verified their paperwork."
+                }]})
+                logger.info("Injected continue-checkin directive (existing todos found)")
+            else:
+                # No checklist yet — tell the LLM to load one
+                transcript.append({'role': 'system', 'content': [{'type': 'text', 'text':
+                    "[PROCEDURE REQUIRED] This is an unidentified guest who has NOT completed check-in. Your FIRST action MUST be to call `Tools__get_guest_checklist` to get the check-in steps. It returns a JSON array — pass that array directly to the `todo` tool to load your checklist. Then use `todo` with merge=true to mark each step in_progress then completed as you work through them. Do NOT greet or say anything until your checklist is loaded. You do NOT know their name or username yet — that will be revealed when you verify their paperwork."
+                }]})
+                logger.info("Injected new-checkin directive (no existing todos)")
+            logger.info(f"Injected new guest procedure directive for caller={caller}")
+
         # If more than an hour since last visit (or first visit), stamp the convo start time
         if not prev_last_visit:
             record_new_conversation(caller)
@@ -806,34 +855,28 @@ async def chat():
         visit_count, _ = get_visit_info(caller)
 
         # Build system prompt string (once, reused each turn)
+        # Hide caller identity from system prompt if guest hasn't completed check-in
+        prompt_caller = "" if needs_checkin else caller
         system_prompt = build_system_prompt(
             base_prompt, skill_texts,
-            caller, visit_count, prev_last_visit
+            prompt_caller, visit_count, prev_last_visit
         )
-
-        # Anonymous / new guest: caller not in visitor DB yet
-        if prev_count == 0:
-            # Inject directive so Atlas follows new guest procedure
-            transcript.append({'role': 'system', 'content': [{'type': 'text', 'text':
-                "[PROCEDURE REQUIRED] This is an unidentified guest. You MUST call the `new_guest` tool now to get the proper arrival procedure. Do not skip this step."
-            }]})
-            logger.info(f"Injected new guest procedure directive for caller={caller}")
 
         # Get or initialize per-session tool inventory
         converted_tools, tool_lookup = get_session_tools()
         logger.info(f"Session tool inventory: {len(converted_tools)} tools, {len(tool_lookup)} in lookup")
 
-        # Pre-load new_guest tool for anonymous visitors
-        if prev_count == 0:
+        # Pre-load get_guest_checklist tool for visitors who haven't completed check-in
+        if needs_checkin:
             _, converted_tools, tool_lookup = await handle_dir_tool(
-                "new_guest", converted_tools, tool_lookup
+                "get_guest_checklist", converted_tools, tool_lookup
             )
-            logger.info("Pre-loaded new_guest tool for anonymous visitor")
+            logger.info("Pre-loaded get_guest_checklist tool for anonymous visitor")
 
         # Multi-turn conversation loop to handle tool calls
         streamTalkId = None
         streamThinkId = None
-        max_turns = 5
+        max_turns = 10
         turn_count = 0
 
         try:
@@ -904,7 +947,7 @@ async def chat():
                     reasoning_content = getattr(delta, 'reasoning_content', None) or getattr(delta, 'reasoning', None)
                     if reasoning_content:
                         if not streamThinkId:
-                            streamThinkId = await atlantis.stream_start("atlas", "Atlas (thinking)")
+                            streamThinkId = await atlantis.stream_start(BOT_SID, f"{BOT_DISPLAY_NAME} (thinking)")
                             logger.info(f"Think stream started with ID: {streamThinkId}")
                         await atlantis.stream(reasoning_content, streamThinkId)
 
@@ -916,7 +959,7 @@ async def chat():
                             streamThinkId = None
 
                         if not streamTalkId:
-                            streamTalkId = await atlantis.stream_start("atlas", "Atlas")
+                            streamTalkId = await atlantis.stream_start(BOT_SID, BOT_DISPLAY_NAME)
                             logger.info(f"Talk stream started with ID: {streamTalkId}")
 
                         text = delta.content
@@ -949,6 +992,15 @@ async def chat():
 
                 # Execute accumulated tool calls if any
                 if tool_calls_accumulator:
+                    # Close any open streams before executing tools so the next
+                    # turn's text starts a fresh chat bubble.
+                    if streamTalkId:
+                        await atlantis.stream_end(streamTalkId)
+                        streamTalkId = None
+                    if streamThinkId:
+                        await atlantis.stream_end(streamThinkId)
+                        streamThinkId = None
+
                     logger.info(f"Executing {len(tool_calls_accumulator)} tool calls")
 
                     # Add assistant message with tool_calls to transcript (OpenAI format)
@@ -974,8 +1026,20 @@ async def chat():
                         try:
                             arguments = json.loads(tc['arguments']) if tc['arguments'] else {}
                         except json.JSONDecodeError as e:
-                            logger.error(f"Failed to parse tool arguments for {tool_key}: {e}")
-                            arguments = {}
+                            logger.warning(f"Invalid JSON for {tool_key}, attempting repair: {e}")
+                            repaired = _repair_json(tc['arguments']) if tc['arguments'] else None
+                            if repaired is not None:
+                                logger.info(f"🔧 Repaired JSON for {tool_key}")
+                                arguments = repaired
+                            else:
+                                logger.error(f"❌ JSON repair failed for {tool_key}: {e}")
+                                transcript.append({
+                                    'role': 'tool',
+                                    'tool_call_id': call_id,
+                                    'content': f"ERROR: Could not parse your tool arguments as JSON: {e}. Please retry with valid JSON (double-quoted keys and strings)."
+                                })
+                                tool_call_made = True
+                                continue
 
                         # Handle dir pseudo-tool
                         if tool_key == 'dir':
@@ -1003,6 +1067,18 @@ async def chat():
                                 'role': 'tool',
                                 'tool_call_id': call_id,
                                 'content': summary
+                            })
+                            tool_call_made = True
+                            continue
+
+                        # Handle todo pseudo-tool
+                        if tool_key == 'todo':
+                            logger.info(f"=== TODO TOOL CALLED ===")
+                            result = await handle_todo_tool(arguments)
+                            transcript.append({
+                                'role': 'tool',
+                                'tool_call_id': call_id,
+                                'content': result
                             })
                             tool_call_made = True
                             continue
@@ -1039,11 +1115,11 @@ async def chat():
                                 logger.info(f"    post-coercion args={format_json_log(arguments)}")
 
                             t0 = _t.monotonic()
-                            logger.info(f"    sending /silent on...")
+                            logger.info("    /silent on")
                             await atlantis.client_command("/silent on")
-                            logger.info(f"    sending %{search_term}...")
+                            logger.info(f"    %{search_term}")
                             tool_result = await atlantis.client_command(f"%{search_term}", data=arguments)
-                            logger.info(f"    sending /silent off...")
+                            logger.info("    /silent off")
                             await atlantis.client_command("/silent off")
                             elapsed = _t.monotonic() - t0
 
@@ -1116,7 +1192,7 @@ async def chat():
         logger.info(f"=== CHAT COMPLETED === session={sessionId} request={requestId} turns={turn_count}")
 
     finally:
-        atlantis.session_shared.remove(_BUSY_KEY)
-        logger.info(f"🔓 RELEASED: session={sessionId} request={requestId}")
+        atlantis.session_shared.remove(busy_key)
+        logger.info(f"🔓 RELEASED: session={sessionId} shell key={busy_key} request={requestId}")
 
-    return
+    return accumulated_text or None

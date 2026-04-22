@@ -8,6 +8,10 @@ venv/
 env/
 build/
 develop-eggs/
+
+# API key scripts with real keys — never commit
+python-server/set_DATAFORSEO.bat
+python-server/set_GOOGLE.bat
 dist/
 downloads/
 eggs/
@@ -47,9 +51,19 @@ yarn-error.log
 *.OLD
 python-server/dynamic_functions/OLD/
 python-server/dynamic_functions/*
+
 !python-server/dynamic_functions/Home
 !python-server/dynamic_functions/Bot
+!python-server/dynamic_functions/Bots
+!python-server/dynamic_functions/Game
+!python-server/dynamic_functions/Games
+!python-server/dynamic_functions/Tick
 !python-server/dynamic_functions/Tools
+!python-server/dynamic_functions/Callback
+!python-server/dynamic_functions/Computer
+!python-server/dynamic_functions/Data
+!python-server/dynamic_functions/Locations
+
 python-server/dynamic_servers/*
 python-server/dynamic_functions/.gitignore
 python-server/dynamic_servers/OLD/
@@ -77,8 +91,18 @@ runServer.log
 python-server/tools_response_debug.json
 python-server/dynamic_functions.TEST/*
 
-# Bot Atlas runtime files (all variants)
+# Bot Kitty runtime files (all variants)
 python-server/dynamic_functions/Bot/Atlas/visitor_data.json
 python-server/dynamic_functions/Bot/Atlas/*/api_payload.json
 python-server/dynamic_functions/Bot/Atlas/*/raw_transcript.json
 python-server/dynamic_functions/Bot/Atlas/*/visitor_log.json
+python-server/dynamic_functions/Callback/raw_transcript.json
+python-server/dynamic_functions/Game/Runtime/raw_transcript.json
+python-server/dynamic_functions/Game/Data/player_data.json
+python-server/dynamic_functions/Bot/Runtime/raw_transcript.json
+python-server/dynamic_functions/Bot/Runtime/api_payload.json
+python-server/dynamic_functions/Computer/computer.db-shm
+python-server/dynamic_functions/Computer/computer.db-wal
+python-server/dynamic_functions/Data/players/*.json
+python-server/dynamic_functions/Data/players/*/
+python-server/runServerSeo

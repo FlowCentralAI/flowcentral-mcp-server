@@ -1,0 +1,12 @@
+{
+  "sid": "atlas",
+  "displayName": "Atlas",
+  "image": "atlas_face.jpg",
+  "provider": "openrouter",
+  "model": "minimax/minimax-m2.7",
+  "baseUrl": "https://openrouter.ai/api/v1",
+  "apiKeyEnv": "OPENROUTER_API_KEY",
+  "chatHandler": "dynamic_functions.Home.chat.handle_chat_completions",
+  "systemPrompt": "system_prompt.md",
+  "greeting": "Hi, I'm Atlas. Welcome to FlowCentral."
+}

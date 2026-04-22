@@ -1,0 +1,6 @@
+{
+  "name": "Lounge",
+  "description": "The executive lounge — drinks, hospitality, and a civilized atmosphere.",
+  "image": "Lounge.jpg",
+  "connects_to": ["Lobby"]
+}
