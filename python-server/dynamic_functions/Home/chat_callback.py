@@ -26,7 +26,8 @@ from dynamic_functions.Data.main import (
     record_bot_interaction,
 )
 # NOTE: these functions are now game-scoped and take game_id as first arg
-from dynamic_functions.Home.game_common import _load_bot_config, get_role_for_bot
+from dynamic_functions.Home.common import _load_bot_config
+from dynamic_functions.Home.character import get_role_for_bot
 
 
 _BUSY_KEY = "chat_busy"

@@ -7,7 +7,7 @@ Basically we have a distributed linux-style system that provides tool infra for 
 
 To get started, clone the repo, do the Python env stuff, set up your API keys as environment variables (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, etc.) and connect this local Python server to the main server (see runServer). We give you all the source code to build your own tool-calling chatbot just like Claude or whatever. See `Games/FlowCentral/Bots/Atlas/` for the bot persona configuration and `Home/chat.py` for the shared chat loop — the bot discovers tools dynamically via search/dir rather than pre-loading them.
 
-*note that `game_set("FlowCentral")` locks the server to a game, then `character_bot()` assigns bots to roles and `game_move_bot()`/`game_move_human()` handles movement between locations
+*note that `game_set("FlowCentral")` locks the server to a game, then `character_bot()` assigns bots to roles and `move_bot()`/`move_human()` handles movement between locations
 
 
 ## FlowCentral Network
@@ -320,12 +320,17 @@ Games/FlowCentral/                   # Game definition
         └── prompt.py
 
 Home/                                # Shared bot + game runtime
+├── main.py                          # Entry point: index(), show_tools()
+├── game.py                          # Game state: game_set(), game_show(), game_list()
+├── bot.py                           # Bot listing with thumbnails
+├── character.py                     # Character CRUD, roles, role_list()
+├── location.py                      # Location listing, movement: move_bot(), move_human(), go()
+├── map.py                           # Interactive visual map of locations
+├── common.py                        # Shared helpers: bot config, movement logic, thumbnails, spawning
 ├── chat.py                          # OpenRouter chat completions handler
 ├── chat_callback.py                 # Routes chat to correct bot via transcript detection
 ├── turn.py                          # Multi-turn LLM conversation loop with tool calls
 ├── bot_common.py                    # Shared utils: transcript fetch, tool discovery
-├── game_common.py                   # Character system, movement, bot spawning
-├── main.py                          # game_set(), game_show(), bot_list(), game_move_bot/human()
 ├── GAME.md                          # ER diagram of the game data model
 ├── MULTIX.md                        # User-facing CLI documentation
 └── README.py                        # Serves MULTIX.md and GAME.md via MCP
@@ -337,9 +342,12 @@ Games manage bot assignments, character roles, locations, and movement. Everythi
 
 - **`game_set(name)`** — Locks the server to a game (e.g. `"FlowCentral"`)
 - **`character_bot(sid, role)`** — Assigns a bot to a role (e.g. `character_bot("atlas", "Greeter")`)
-- **`character_human(role, name)`** — Assigns a human player to a role
-- **`game_move_bot(sid, location)`** / **`game_move_human(sid, location)`** — Moves characters between locations
+- **`character_human(sid, role, name)`** — Assigns a human player to a role
+- **`character_self(role, name)`** — Assigns the caller as a human character
+- **`move_bot(sid, location)`** / **`move_human(sid, location)`** — Moves characters between locations
+- **`go(location)`** — Moves the caller's character and updates the background
 - **`game_show()`** — Renders a live ER diagram of the game state
+- **`map(location)`** — Shows a visual map of the current location and adjacent areas
 
 Locations are defined as JSON files in `Games/<game>/Locations/` with adjacency graphs (`connects_to`). Movement is only allowed along connected edges. New players start at the default location (marked with `"default": true`).
 
@@ -362,8 +370,13 @@ Data/
 
 - **`python-server/dynamic_functions/Home/MULTIX.md`** — User-facing documentation for the FlowCentral MCP tools (commands, search terms, tool prefixes, etc.). This is the file served by the `readme` MCP tool.
 - **`Games/FlowCentral/Bots/Atlas/config.json`** — Bot configuration: model (minimax-m2.7), provider (OpenRouter), greeting message, and references for the chat handler and system prompt.
-- **`Home/main.py`** — Game lifecycle tools: `game_set()`, `game_show()`, `bot_list()`, `location_list()`, `game_move_bot()`, `game_move_human()`.
-- **`Home/game_common.py`** — Character system (`character_bot()`, `character_human()`, `character_list()`), movement logic, bot spawning.
+- **`Home/main.py`** — Entry point: `index()`, `show_tools()`.
+- **`Home/game.py`** — Game lifecycle: `game_set()`, `game_show()`, `game_list()`, `game_status()`.
+- **`Home/bot.py`** — Bot listing with thumbnail generation.
+- **`Home/character.py`** — Character system: `character_bot()`, `character_human()`, `character_self()`, `character_list()`, `role_list()`.
+- **`Home/location.py`** — Location listing, positions, and movement: `move_bot()`, `move_human()`, `go()`.
+- **`Home/map.py`** — Interactive visual map of locations with ELK.js layout.
+- **`Home/common.py`** — Shared helpers: bot config loading, movement logic, thumbnail generation, bot spawning.
 - **`Home/chat_callback.py`** — Chat routing: detects which bot is in the room from the transcript and dispatches to its chat handler.
 - **`Data/main.py`** — Game-scoped data system: positions, profiles, interactions, all under `Data/{game_id}/`.
 
